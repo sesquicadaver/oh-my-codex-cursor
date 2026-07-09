@@ -6,6 +6,24 @@ import { describe, it } from 'node:test';
 import { isHookPluginFeatureEnabled, dispatchHookEvent } from '../dispatcher.js';
 import { buildHookEvent } from '../events.js';
 
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!processExists(pid)) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`process ${pid} should exit before timeout`);
+}
+
 describe('isHookPluginFeatureEnabled', () => {
   it('returns true when OMX_HOOK_PLUGINS=1', () => {
     assert.equal(isHookPluginFeatureEnabled({ OMX_HOOK_PLUGINS: '1' }), true);
@@ -208,9 +226,12 @@ export async function onHookEvent() {}
     try {
       const dir = join(cwd, '.omx', 'hooks');
       await mkdir(dir, { recursive: true });
+      const pidFile = join(cwd, 'plugin-runner.pid');
       await writeFile(
         join(dir, 'ignore-sigterm.mjs'),
-        `export async function onHookEvent() {
+        `import { writeFileSync } from 'node:fs';
+        export async function onHookEvent() {
+          writeFileSync(process.env.OMX_TEST_PLUGIN_PID_FILE, String(process.pid));
           process.on('SIGTERM', () => {});
           setInterval(() => {}, 60_000);
           await new Promise(() => {});
@@ -221,10 +242,11 @@ export async function onHookEvent() {}
       const startedAt = Date.now();
       const result = await dispatchHookEvent(event, {
         cwd,
-        timeoutMs: 50,
-        env: { ...process.env, OMX_HOOK_PLUGINS: '1' },
+        timeoutMs: 300,
+        env: { ...process.env, OMX_HOOK_PLUGINS: '1', OMX_TEST_PLUGIN_PID_FILE: pidFile },
       });
       const elapsedMs = Date.now() - startedAt;
+      const pid = Number(await readFile(pidFile, 'utf8'));
 
       assert.equal(result.enabled, true);
       assert.equal(result.plugin_count, 1);
@@ -232,6 +254,46 @@ export async function onHookEvent() {}
       assert.equal(result.results[0].ok, false);
       assert.equal(result.results[0].status, 'timeout');
       assert.ok(elapsedMs < 1500, `dispatch should timeout promptly (elapsed=${elapsedMs}ms)`);
+      await waitForProcessExit(pid);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('dedupes repeated native lifecycle hook dispatches for the same session/turn fingerprint', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-dispatch-dedupe-'));
+    try {
+      const dir = join(cwd, '.omx', 'hooks');
+      await mkdir(dir, { recursive: true });
+      await writeFile(
+        join(dir, 'good.mjs'),
+        'export async function onHookEvent(event, sdk) { const count = Number((await sdk.state.read("count", 0)) || 0); await sdk.state.write("count", count + 1); }',
+      );
+
+      const event = buildHookEvent('keyword-detector', {
+        source: 'native',
+        session_id: 'sess-1',
+        thread_id: 'thread-1',
+        turn_id: 'turn-1',
+        context: { phase: 'prompt-submitted', marker: 'same-turn' },
+      });
+
+      const first = await dispatchHookEvent(event, {
+        cwd,
+        env: { ...process.env, OMX_HOOK_PLUGINS: '1' },
+      });
+      const second = await dispatchHookEvent(event, {
+        cwd,
+        env: { ...process.env, OMX_HOOK_PLUGINS: '1' },
+      });
+
+      assert.equal(first.enabled, true);
+      assert.equal(first.results.length, 1);
+      assert.equal(first.results[0].ok, true);
+
+      assert.equal(second.enabled, true);
+      assert.equal(second.reason, 'deduped');
+      assert.equal(second.results.length, 0);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

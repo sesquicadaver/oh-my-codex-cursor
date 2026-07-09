@@ -7,8 +7,14 @@ import { existsSync, readFileSync } from "fs";
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { join } from "path";
 import { AGENT_DEFINITIONS, AgentDefinition } from "./definitions.js";
+import { readCatalogManifest } from "../catalog/reader.js";
+import type { CatalogManifest } from "../catalog/schema.js";
+import { getInstallableNativeAgentNames } from "./policy.js";
 import {
+  getCodexConfigRootModelProvider,
   getEnvConfiguredStandardDefaultModel,
+  getAgentReasoningOverride,
+  getAgentModelOverride,
   getMainDefaultModel,
   getSparkDefaultModel,
   getStandardDefaultModel,
@@ -17,6 +23,7 @@ import { getRootModelName } from "../config/generator.js";
 import { codexAgentsDir } from "../utils/paths.js";
 
 export const EXACT_GPT_5_4_MINI_MODEL = "gpt-5.4-mini";
+export const EXACT_RESEARCHER_MODEL = EXACT_GPT_5_4_MINI_MODEL;
 
 const POSTURE_OVERLAYS: Record<AgentDefinition["posture"], string> = {
   "frontier-orchestrator": [
@@ -49,7 +56,7 @@ const POSTURE_OVERLAYS: Record<AgentDefinition["posture"], string> = {
     "- Optimize for fast triage, search, lightweight synthesis, and narrow routing decisions.",
     "- Do not start deep implementation unless the task is tightly bounded and obvious.",
     "- If the task expands beyond quick classification or lightweight execution, escalate to a frontier-orchestrator or deep-worker role.",
-    "- Keep responses concise, scope-aware, and conservative under ambiguity.",
+    "- Keep responses quality-first, scope-aware, and conservative under ambiguity; avoid empty verbosity and reflexive tool escalation.",
     "",
     "</posture_overlay>",
   ].join("\n"),
@@ -85,16 +92,27 @@ const MODEL_CLASS_OVERLAYS: Record<AgentDefinition["modelClass"], string> = {
   ].join("\n"),
 };
 
-const EXACT_MINI_MODEL_OVERLAY = [
-  "<exact_model_guidance>",
+function buildExactModelOverlay(exactModel: string): string {
+  return [
+    "<exact_model_guidance>",
+    "",
+    `This role is executing under the exact ${exactModel} model.`,
+    "- Use a strict execution order: inspect -> plan -> act -> verify.",
+    "- Treat completion criteria as explicit: only report done after the requested work is implemented and fresh verification passes.",
+    "- If requirements are ambiguous or a blocker appears, state the blocker plainly and stop guessing until the missing decision is resolved.",
+    "- Do not bluff, pad, or invent results; report missing evidence and incomplete work honestly.",
+    "",
+    "</exact_model_guidance>",
+  ].join("\n");
+}
+
+const NATIVE_SUBAGENT_LEAF_GUARD = [
+  "<native_subagent_leaf_guard>",
   "",
-  `This role is executing under the exact ${EXACT_GPT_5_4_MINI_MODEL} model.`,
-  "- Use a strict execution order: inspect -> plan -> act -> verify.",
-  "- Treat completion criteria as explicit: only report done after the requested work is implemented and fresh verification passes.",
-  "- If requirements are ambiguous or a blocker appears, state the blocker plainly and stop guessing until the missing decision is resolved.",
-  "- Do not bluff, pad, or invent results; report missing evidence and incomplete work honestly.",
+  "Leaf native subagent: do not call Task, spawn_agent, or native child agents.",
+  "Use local tools; report missing specialist coverage to the leader.",
   "",
-  "</exact_model_guidance>",
+  "</native_subagent_leaf_guard>",
 ].join("\n");
 
 export interface GeneratedNativeAgentConfig {
@@ -102,6 +120,7 @@ export interface GeneratedNativeAgentConfig {
   description: string;
   developerInstructions?: string;
   model?: string;
+  modelProvider?: string;
   reasoningEffort?: "low" | "medium" | "high" | "xhigh";
 }
 
@@ -116,6 +135,12 @@ interface RoleInstructionMetadata {
   posture: AgentDefinition["posture"];
   modelClass: AgentDefinition["modelClass"];
   routingRole: AgentDefinition["routingRole"];
+  nativeSubagentDelegation?: AgentDefinition["nativeSubagentDelegation"];
+  exactModel?: AgentDefinition["exactModel"];
+}
+
+interface ComposeRoleInstructionsOptions {
+  nativeAgent?: boolean;
 }
 
 function readConfigTomlContent(
@@ -153,6 +178,14 @@ function resolveAgentModel(
   agent: AgentDefinition,
   options: AgentModelResolutionOptions = {},
 ): string {
+  const modelOverride = getAgentModelOverride(agent.name, options.codexHomeOverride);
+  if (modelOverride) {
+    return modelOverride;
+  }
+  if (agent.exactModel) {
+    return agent.exactModel;
+  }
+
   if (agent.name === "executor") {
     return resolveFrontierModel(options);
   }
@@ -168,14 +201,21 @@ function resolveAgentModel(
   }
 }
 
-function isExactMiniModel(resolvedModel?: string | null): boolean {
-  return resolvedModel?.trim() === EXACT_GPT_5_4_MINI_MODEL;
+function shouldInheritRootModelProvider(
+  agent: AgentDefinition,
+  resolvedModel: string,
+  options: AgentModelResolutionOptions = {},
+): boolean {
+  if (agent.modelClass !== "fast") return true;
+  if (getAgentModelOverride(agent.name, options.codexHomeOverride)) return true;
+  return resolvedModel !== getSparkDefaultModel(options.codexHomeOverride);
 }
 
 export function composeRoleInstructions(
   promptContent: string,
   metadata: RoleInstructionMetadata | null,
   resolvedModel?: string,
+  options: ComposeRoleInstructionsOptions = {},
 ): string {
   const instructions = stripFrontmatter(promptContent);
   const parts = [instructions];
@@ -189,8 +229,14 @@ export function composeRoleInstructions(
     );
   }
 
-  if (isExactMiniModel(resolvedModel)) {
-    parts.push("", EXACT_MINI_MODEL_OVERLAY);
+  const exactModel = metadata?.exactModel
+    ?? (resolvedModel?.trim() === EXACT_GPT_5_4_MINI_MODEL ? EXACT_GPT_5_4_MINI_MODEL : undefined);
+  if (exactModel && resolvedModel?.trim() === exactModel) {
+    parts.push("", buildExactModelOverlay(exactModel));
+  }
+
+  if (options.nativeAgent === true && metadata?.nativeSubagentDelegation !== "allowed") {
+    parts.push("", NATIVE_SUBAGENT_LEAF_GUARD);
   }
 
   const metadataLines = [];
@@ -202,6 +248,9 @@ export function composeRoleInstructions(
       `- model_class: ${metadata.modelClass}`,
       `- routing_role: ${metadata.routingRole}`,
     );
+    if (options.nativeAgent === true && metadata.nativeSubagentDelegation) {
+      metadataLines.push(`- native_subagent_delegation: ${metadata.nativeSubagentDelegation}`);
+    }
   }
   if (resolvedModel) {
     if (metadataLines.length === 0) {
@@ -228,9 +277,11 @@ export function composeRoleInstructionsForRole(
       ? {
           name: agent.name,
           posture: agent.posture,
-          modelClass: agent.modelClass,
-          routingRole: agent.routingRole,
-        }
+      modelClass: agent.modelClass,
+      routingRole: agent.routingRole,
+      nativeSubagentDelegation: agent.nativeSubagentDelegation,
+      exactModel: agent.exactModel,
+    }
       : null,
     resolvedModel,
   );
@@ -271,6 +322,9 @@ export function generateStandaloneAgentToml(
   if (config.model) {
     lines.push(`model = "${escapeTomlBasicString(config.model)}"`);
   }
+  if (config.modelProvider) {
+    lines.push(`model_provider = "${escapeTomlBasicString(config.modelProvider)}"`);
+  }
   if (config.reasoningEffort) {
     lines.push(`model_reasoning_effort = "${config.reasoningEffort}"`);
   }
@@ -297,12 +351,22 @@ export function generateAgentToml(
   options: AgentModelResolutionOptions = {},
 ): string {
   const resolvedModel = resolveAgentModel(agent, options);
+  const resolvedModelProvider = shouldInheritRootModelProvider(agent, resolvedModel, options)
+    ? getCodexConfigRootModelProvider(options.codexHomeOverride)
+    : undefined;
   return generateStandaloneAgentToml({
     name: agent.name,
     description: agent.description,
-    developerInstructions: composeRoleInstructions(promptContent, agent, resolvedModel),
+    developerInstructions: composeRoleInstructions(
+      promptContent,
+      agent,
+      resolvedModel,
+      { nativeAgent: true },
+    ),
     model: resolvedModel,
-    reasoningEffort: agent.reasoningEffort,
+    modelProvider: resolvedModelProvider,
+    reasoningEffort: getAgentReasoningOverride(agent.name, options.codexHomeOverride)
+      ?? agent.reasoningEffort,
   });
 }
 
@@ -317,6 +381,8 @@ export async function installNativeAgentConfigs(
     dryRun?: boolean;
     verbose?: boolean;
     agentsDir?: string;
+    catalogManifest?: CatalogManifest;
+    allowUncatalogedDefinitions?: boolean;
   } = {},
 ): Promise<number> {
   const {
@@ -324,6 +390,8 @@ export async function installNativeAgentConfigs(
     dryRun = false,
     verbose = false,
     agentsDir = codexAgentsDir(),
+    catalogManifest,
+    allowUncatalogedDefinitions = false,
   } = options;
   const codexHomeOverride = join(agentsDir, "..");
 
@@ -333,7 +401,16 @@ export async function installNativeAgentConfigs(
 
   let count = 0;
 
-  for (const [name, agent] of Object.entries(AGENT_DEFINITIONS)) {
+  const installableAgentNames = allowUncatalogedDefinitions
+    ? new Set(Object.keys(AGENT_DEFINITIONS))
+    : getInstallableNativeAgentNames(catalogManifest ?? readCatalogManifest(pkgRoot));
+
+  for (const name of [...installableAgentNames].sort()) {
+    const agent = AGENT_DEFINITIONS[name];
+    if (!agent) {
+      if (verbose) console.log(`  skip ${name} (no agent definition)`);
+      continue;
+    }
     const promptPath = join(pkgRoot, "prompts", `${name}.md`);
     if (!existsSync(promptPath)) {
       if (verbose) console.log(`  skip ${name} (no prompt file)`);

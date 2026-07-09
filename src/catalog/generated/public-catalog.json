@@ -1,17 +1,18 @@
 {
-  "generatedAt": "2026-03-10T10:43:36.374Z",
+  "generatedAt": "2026-06-17T05:57:55.659Z",
   "version": "2026.02.28.1",
   "counts": {
-    "skillCount": 39,
-    "promptCount": 30,
-    "activeSkillCount": 23,
-    "activeAgentCount": 18
+    "skillCount": 50,
+    "promptCount": 34,
+    "activeSkillCount": 28,
+    "activeAgentCount": 20
   },
   "coreSkills": [
     "autopilot",
     "ralph",
     "ultrawork",
     "team",
+    "ultragoal",
     "ralplan"
   ],
   "skills": [
@@ -46,24 +47,56 @@
     {
       "name": "ecomode",
       "category": "execution",
-      "status": "merged",
-      "canonical": "ultrawork",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "ultraqa",
       "category": "execution",
-      "status": "merged",
-      "canonical": "ralph",
+      "status": "active",
       "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "autoresearch",
+      "category": "execution",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "autoresearch-goal",
+      "category": "execution",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "performance-goal",
+      "category": "execution",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "pipeline",
+      "category": "execution",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "ultragoal",
+      "category": "execution",
+      "status": "active",
+      "core": true,
       "internalRequired": false
     },
     {
       "name": "swarm",
       "category": "execution",
-      "status": "alias",
-      "canonical": "team",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
@@ -90,34 +123,44 @@
       "internalRequired": false
     },
     {
+      "name": "prometheus-strict",
+      "category": "planning",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "best-practice-research",
+      "category": "planning",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
       "name": "analyze",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "debugger",
+      "status": "active",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "deepsearch",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "explore",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "tdd",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "test-engineer",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "build-fix",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "build-fixer",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
@@ -139,32 +182,44 @@
     {
       "name": "security-review",
       "category": "shortcut",
-      "status": "active",
-      "canonical": "security-reviewer",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "visual-verdict",
       "category": "shortcut",
-      "status": "active",
-      "canonical": "vision",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "web-clone",
       "category": "shortcut",
+      "status": "deprecated",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "visual-ralph",
+      "category": "shortcut",
       "status": "active",
-      "canonical": "vision",
+      "canonical": "designer",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "design",
+      "category": "shortcut",
+      "status": "active",
+      "canonical": "designer",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "frontend-ui-ux",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "designer",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
@@ -179,22 +234,28 @@
     {
       "name": "review",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "plan --review",
+      "status": "deprecated",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "ask",
+      "category": "shortcut",
+      "status": "active",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "ask-claude",
       "category": "shortcut",
-      "status": "active",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "ask-gemini",
       "category": "shortcut",
-      "status": "active",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
@@ -213,23 +274,30 @@
       "internalRequired": false
     },
     {
-      "name": "help",
+      "name": "wiki",
       "category": "utility",
       "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "help",
+      "category": "utility",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "note",
       "category": "utility",
-      "status": "active",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "trace",
       "category": "utility",
-      "status": "active",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
@@ -296,8 +364,7 @@
     {
       "name": "ralph-init",
       "category": "utility",
-      "status": "merged",
-      "canonical": "plan",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
@@ -371,7 +438,7 @@
     {
       "name": "security-reviewer",
       "category": "review",
-      "status": "active"
+      "status": "deprecated"
     },
     {
       "name": "performance-reviewer",
@@ -403,7 +470,7 @@
     {
       "name": "build-fixer",
       "category": "domain",
-      "status": "active"
+      "status": "deprecated"
     },
     {
       "name": "designer",
@@ -461,7 +528,27 @@
       "canonical": "analyst"
     },
     {
+      "name": "prometheus-strict-metis",
+      "category": "coordination",
+      "status": "active"
+    },
+    {
+      "name": "prometheus-strict-momus",
+      "category": "coordination",
+      "status": "active"
+    },
+    {
+      "name": "prometheus-strict-oracle",
+      "category": "coordination",
+      "status": "active"
+    },
+    {
       "name": "critic",
+      "category": "coordination",
+      "status": "active"
+    },
+    {
+      "name": "scholastic",
       "category": "coordination",
       "status": "active"
     },
@@ -473,44 +560,8 @@
   ],
   "aliases": [
     {
-      "name": "ecomode",
-      "canonical": "ultrawork"
-    },
-    {
-      "name": "ultraqa",
-      "canonical": "ralph"
-    },
-    {
-      "name": "swarm",
-      "canonical": "team"
-    },
-    {
-      "name": "analyze",
-      "canonical": "debugger"
-    },
-    {
-      "name": "deepsearch",
-      "canonical": "explore"
-    },
-    {
-      "name": "tdd",
-      "canonical": "test-engineer"
-    },
-    {
-      "name": "build-fix",
-      "canonical": "build-fixer"
-    },
-    {
-      "name": "frontend-ui-ux",
-      "canonical": "designer"
-    },
-    {
       "name": "git-master",
       "canonical": "git-master"
-    },
-    {
-      "name": "review",
-      "canonical": "plan --review"
     },
     {
       "name": "configure-discord",
@@ -527,10 +578,6 @@
     {
       "name": "configure-openclaw",
       "canonical": "configure-notifications"
-    },
-    {
-      "name": "ralph-init",
-      "canonical": "plan"
     }
   ],
   "internalHidden": [

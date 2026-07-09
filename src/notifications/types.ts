@@ -135,6 +135,9 @@ export interface FullNotificationConfig {
   /** Notification verbosity level (default: "session") */
   verbosity?: VerbosityLevel;
 
+  /** Include native child-agent/subagent lifecycle start/finish hook dispatches (default: false) */
+  includeChildAgents?: boolean;
+
   /** Default platform configs (used when event-specific config is not set) */
   discord?: DiscordNotificationConfig;
   "discord-bot"?: DiscordBotNotificationConfig;
@@ -201,6 +204,8 @@ export interface FullNotificationPayload {
   tmuxPaneId?: string;
   /** Captured tmux pane output (tail lines) for session-level notifications */
   tmuxTail?: string;
+  /** Whether the tmux tail came from a session/pane proven live at capture time */
+  tmuxTailLive?: boolean;
   /** Agent name (populated by extensibility plugins, not set by core Codex CLI hooks) */
   agentName?: string;
   /** Agent type (populated by extensibility plugins, not set by core Codex CLI hooks) */

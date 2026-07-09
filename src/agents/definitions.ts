@@ -7,12 +7,22 @@
 export interface AgentDefinition {
   name: string;
   description: string;
-  reasoningEffort: 'low' | 'medium' | 'high';
+  reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh';
+  /** Optional exact model pin for roles that should bypass tier defaults. */
+  exactModel?: 'gpt-5.4-mini' | 'gpt-5.5';
   posture: 'frontier-orchestrator' | 'deep-worker' | 'fast-lane';
   modelClass: 'frontier' | 'standard' | 'fast';
   routingRole: 'leader' | 'specialist' | 'executor';
   /** Tool access pattern */
   tools: 'read-only' | 'analysis' | 'execution' | 'data';
+  /**
+   * Whether a generated native-agent role may dispatch child native subagents.
+   * Omitted means the role is a leaf lane and must report missing specialist
+   * coverage upward to its leader instead of spawning grandchildren. This is
+   * enforced by generated native developer instructions plus verifier checks;
+   * add a runtime tool-capability gate here if native TOML gains one later.
+   */
+  nativeSubagentDelegation?: 'allowed';
   /** Category for grouping */
   category: 'build' | 'review' | 'domain' | 'product' | 'coordination';
 }
@@ -20,7 +30,7 @@ export interface AgentDefinition {
 const EXECUTOR_AGENT: AgentDefinition = {
   name: 'executor',
   description: 'Code implementation, refactoring, feature work',
-  reasoningEffort: 'high',
+  reasoningEffort: 'medium',
   posture: 'deep-worker',
   modelClass: 'standard',
   routingRole: 'executor',
@@ -65,6 +75,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
     name: 'planner',
     description: 'Task sequencing, execution plans, risk flags',
     reasoningEffort: 'medium',
+    exactModel: 'gpt-5.5',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',
     routingRole: 'leader',
@@ -74,7 +85,8 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   'architect': {
     name: 'architect',
     description: 'System design, boundaries, interfaces, long-horizon tradeoffs',
-    reasoningEffort: 'high',
+    reasoningEffort: 'xhigh',
+    exactModel: 'gpt-5.5',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',
     routingRole: 'leader',
@@ -261,6 +273,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
     name: 'researcher',
     description: 'External documentation and reference research',
     reasoningEffort: 'high',
+    exactModel: 'gpt-5.4-mini',
     posture: 'fast-lane',
     modelClass: 'standard',
     routingRole: 'specialist',
@@ -311,9 +324,52 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   },
 
   // Coordination
+
+  'prometheus-strict-metis': {
+    name: 'prometheus-strict-metis',
+    description: 'Prometheus Strict requirements interviewer and ambiguity mapper',
+    reasoningEffort: 'high',
+    posture: 'frontier-orchestrator',
+    modelClass: 'frontier',
+    routingRole: 'leader',
+    tools: 'analysis',
+    nativeSubagentDelegation: 'allowed',
+    category: 'coordination',
+  },
+  'prometheus-strict-momus': {
+    name: 'prometheus-strict-momus',
+    description: 'Prometheus Strict adversarial plan critic and risk challenger',
+    reasoningEffort: 'high',
+    posture: 'frontier-orchestrator',
+    modelClass: 'frontier',
+    routingRole: 'leader',
+    tools: 'analysis',
+    category: 'coordination',
+  },
+  'prometheus-strict-oracle': {
+    name: 'prometheus-strict-oracle',
+    description: 'Prometheus Strict implementation readiness verifier and handoff judge',
+    reasoningEffort: 'high',
+    posture: 'frontier-orchestrator',
+    modelClass: 'standard',
+    routingRole: 'leader',
+    tools: 'analysis',
+    category: 'coordination',
+  },
+
   'critic': {
     name: 'critic',
     description: 'Plan/design critical challenge and review',
+    reasoningEffort: 'high',
+    posture: 'frontier-orchestrator',
+    modelClass: 'frontier',
+    routingRole: 'leader',
+    tools: 'read-only',
+    category: 'coordination',
+  },
+  'scholastic': {
+    name: 'scholastic',
+    description: 'Ontology-first reasoning reviewer: category mistakes, hidden assumptions, modality separation, scholastic critique, and minimal-repair proposals',
     reasoningEffort: 'high',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',

@@ -39,6 +39,7 @@ export interface ResolveAvailableAgentTypesOptions {
 }
 
 export interface BuildFollowupStaffingPlanOptions {
+  codexHomeOverride?: string;
   workerCount?: number;
   fallbackRole?: string;
 }
@@ -122,14 +123,28 @@ function chooseAvailableRole(
   return availableRoles[0] ?? fallbackRole;
 }
 
+function chooseDistinctAvailableRole(
+  availableRoles: readonly string[],
+  preferredRoles: readonly string[],
+  fallbackRole: string,
+  disallowedRoles: readonly string[],
+): string {
+  for (const role of preferredRoles) {
+    if (!disallowedRoles.includes(role) && availableRoles.includes(role)) return role;
+  }
+  if (!disallowedRoles.includes(fallbackRole) && availableRoles.includes(fallbackRole)) return fallbackRole;
+  return availableRoles.find((role) => !disallowedRoles.includes(role)) ?? fallbackRole;
+}
+
 function mergeAllocation(
   allocations: FollowupAllocation[],
   role: string,
   count: number,
   reason: string,
+  codexHomeOverride?: string,
 ): void {
   if (count <= 0) return;
-  const reasoningEffort = resolveAgentReasoningEffort(role);
+  const reasoningEffort = resolveAgentReasoningEffort(role, codexHomeOverride);
   const existing = allocations.find(
     (item) => item.role === role && item.reason === reason && item.reasoningEffort === reasoningEffort,
   );
@@ -204,26 +219,55 @@ function pickSpecialistRole(
   task: string,
   availableRoles: readonly string[],
   fallbackRole: string,
+  primaryRole: string,
 ): string {
   const normalizedTask = task.toLowerCase();
+  const wantsExplore = (
+    /\b(?:check|find|inspect|locate|look up|lookup|map|review|search|trace|understand|which files?|where(?:\s+is|\s+are)?)\b/.test(normalizedTask)
+      && /\b(?:file|files|symbol|symbols|repo|repository|codebase|path|paths|usage|usages|relationship|relationships|implementation|local|call sites?|integration points?)\b/.test(normalizedTask)
+  ) || /\b(?:call sites?|current(?:ly)? use|how we use|integration points?|our usage|where we use)\b/.test(normalizedTask);
+  const wantsDependencyExpert = /\b(?:dependency|dependencies|package|packages|sdk|sdks|library|libraries|framework|frameworks|npm|pypi|license|maintenance|migration path|download stats?)\b/.test(normalizedTask)
+    && /\b(?:adopt|assess|choose|compare|evaluate|recommend|replace|risk|select|swap|upgrade)\b/.test(normalizedTask);
+  const wantsResearcher = /\b(?:official docs?|upstream docs?|vendor docs?|reference|references|api docs?|release notes?|version(?:ing)?|compatib(?:ility|le)|research)\b/.test(normalizedTask)
+    || (
+      /\b(?:api|framework|frameworks|library|libraries|sdk|sdks|vendor)\b/.test(normalizedTask)
+      && /\b(?:best way|behavior|example|examples|feature|features?|how to use|in the wild|parameter|parameters|usage|what does|why does)\b/.test(normalizedTask)
+    );
+
+  if (wantsExplore && wantsDependencyExpert) {
+    return chooseDistinctAvailableRole(
+      availableRoles,
+      primaryRole === 'explore' ? ['dependency-expert', 'researcher'] : ['explore', 'dependency-expert'],
+      fallbackRole,
+      [primaryRole],
+    );
+  }
+  if (wantsExplore && wantsResearcher) {
+    return chooseDistinctAvailableRole(
+      availableRoles,
+      primaryRole === 'explore' ? ['researcher', 'dependency-expert'] : ['explore', 'researcher'],
+      fallbackRole,
+      [primaryRole],
+    );
+  }
 
   if (/(security|auth|authorization|authentication|xss|injection|cve|vulnerability)/.test(normalizedTask)) {
-    return chooseAvailableRole(availableRoles, ['security-reviewer', 'architect'], fallbackRole);
+    return chooseDistinctAvailableRole(availableRoles, ['code-reviewer', 'architect'], fallbackRole, [primaryRole]);
   }
   if (/(debug|regression|root cause|stack trace|incident|flaky)/.test(normalizedTask)) {
-    return chooseAvailableRole(availableRoles, ['debugger', 'architect'], fallbackRole);
+    return chooseDistinctAvailableRole(availableRoles, ['debugger', 'architect'], fallbackRole, [primaryRole]);
   }
   if (/(build|compile|tsc|type error|lint)/.test(normalizedTask)) {
-    return chooseAvailableRole(availableRoles, ['build-fixer', 'debugger'], fallbackRole);
+    return chooseDistinctAvailableRole(availableRoles, ['debugger', 'executor'], fallbackRole, [primaryRole]);
   }
   if (/(ui|ux|layout|css|responsive|design|frontend)/.test(normalizedTask)) {
-    return chooseAvailableRole(availableRoles, ['designer'], fallbackRole);
+    return chooseDistinctAvailableRole(availableRoles, ['designer'], fallbackRole, [primaryRole]);
   }
   if (/(readme|docs|documentation|changelog|migration)/.test(normalizedTask)) {
-    return chooseAvailableRole(availableRoles, ['writer'], fallbackRole);
+    return chooseDistinctAvailableRole(availableRoles, ['writer'], fallbackRole, [primaryRole]);
   }
 
-  return chooseAvailableRole(availableRoles, ['architect', 'researcher'], fallbackRole);
+  return chooseDistinctAvailableRole(availableRoles, ['architect', 'researcher'], fallbackRole, [primaryRole]);
 }
 
 export function buildFollowupStaffingPlan(
@@ -248,31 +292,37 @@ export function buildFollowupStaffingPlan(
   );
   const allocations: FollowupAllocation[] = [];
 
-  mergeAllocation(allocations, primaryRole, 1, mode === 'team' ? 'primary delivery lane' : 'primary implementation lane');
+  mergeAllocation(
+    allocations,
+    primaryRole,
+    1,
+    mode === 'team' ? 'primary delivery lane' : 'primary implementation lane',
+    options.codexHomeOverride,
+  );
 
   if (mode === 'team') {
     if (workerCount >= 2) {
-      mergeAllocation(allocations, qualityRole, 1, 'verification + regression lane');
+      mergeAllocation(allocations, qualityRole, 1, 'verification + regression lane', options.codexHomeOverride);
     }
     if (workerCount >= 3) {
-      const specialistRole = pickSpecialistRole(task, availableAgentTypes, primaryRole);
-      mergeAllocation(allocations, specialistRole, 1, 'specialist support lane');
+      const specialistRole = pickSpecialistRole(task, availableAgentTypes, primaryRole, primaryRole);
+      mergeAllocation(allocations, specialistRole, 1, 'specialist support lane', options.codexHomeOverride);
     }
     if (workerCount >= 4) {
-      mergeAllocation(allocations, primaryRole, workerCount - 3, 'extra implementation capacity');
+      mergeAllocation(allocations, primaryRole, workerCount - 3, 'extra implementation capacity', options.codexHomeOverride);
     }
   } else {
-    mergeAllocation(allocations, qualityRole, 1, 'evidence + regression checks');
+    mergeAllocation(allocations, qualityRole, 1, 'evidence + regression checks', options.codexHomeOverride);
     const architectRole = chooseAvailableRole(
       availableAgentTypes,
       ['architect', 'critic', 'verifier'],
       qualityRole,
     );
-    mergeAllocation(allocations, architectRole, 1, 'final architecture / completion sign-off');
+    mergeAllocation(allocations, architectRole, 1, 'final architecture / completion sign-off', options.codexHomeOverride);
 
     if (workerCount >= 4) {
-      const specialistRole = pickSpecialistRole(task, availableAgentTypes, primaryRole);
-      mergeAllocation(allocations, specialistRole, workerCount - 3, 'parallel specialist follow-up capacity');
+      const specialistRole = pickSpecialistRole(task, availableAgentTypes, primaryRole, primaryRole);
+      mergeAllocation(allocations, specialistRole, workerCount - 3, 'parallel specialist follow-up capacity', options.codexHomeOverride);
     }
   }
 

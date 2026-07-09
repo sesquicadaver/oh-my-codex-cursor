@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { PassThrough } from 'node:stream';
-import { mkdtemp, readFile, rm, writeFile, chmod } from 'fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -19,6 +19,9 @@ import {
   buildUnregisterClientAttachedReconcileArgs,
   buildUnregisterResizeHookArgs,
   buildWorkerStartupCommand,
+  trustWorkerMiseConfigIfAvailable,
+  writeWorkerStartupScriptCommand,
+  shouldSourceTeamWorkerShellRc,
   buildHudPaneTarget,
   chooseTeamLeaderPaneId,
   createTeamSession,
@@ -26,6 +29,8 @@ import {
   isMsysOrGitBash,
   isNativeWindows,
   isTmuxAvailable,
+  isWorkerPaneOpen,
+  restoreStandaloneHudPane,
   translatePathForMsys,
   isWsl2,
   isWorkerAlive,
@@ -45,11 +50,22 @@ import {
   sleepFractionalSeconds,
   translateWorkerLaunchArgsForCli,
   waitForWorkerReady,
+  waitForWorkerReadyAsync,
   paneIsBootstrapping,
+  classifyWorkerStartupInjectSafety,
+  checkWorkerStartupInjectSafety,
   dismissTrustPromptIfPresent,
+  evaluateStartupDirectTriggerSafetyCapture,
+  mitigateCopyModeUnderlineArtifacts,
 } from '../tmux-session.js';
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES } from '../../hud/constants.js';
 import * as tmuxSessionModule from '../tmux-session.js';
+import { OMX_ENTRY_PATH_ENV, OMX_STARTUP_CWD_ENV } from '../../utils/paths.js';
+
+const fsMutable = fs as typeof fs & {
+  existsSync: typeof fs.existsSync;
+  statSync: typeof fs.statSync;
+};
 
 function withEmptyPath<T>(fn: () => T): T {
   const prev = process.env.PATH;
@@ -63,13 +79,25 @@ function withEmptyPath<T>(fn: () => T): T {
 }
 
 function withMockedExistsSync<T>(mock: typeof fs.existsSync, fn: () => T): T {
-  const original = fs.existsSync;
-  fs.existsSync = mock;
+  const original = fsMutable.existsSync;
+  fsMutable.existsSync = mock;
   syncBuiltinESMExports();
   try {
     return fn();
   } finally {
-    fs.existsSync = original;
+    fsMutable.existsSync = original;
+    syncBuiltinESMExports();
+  }
+}
+
+function withMockedStatSync<T>(mock: typeof fs.statSync, fn: () => T): T {
+  const original = fsMutable.statSync;
+  fsMutable.statSync = mock;
+  syncBuiltinESMExports();
+  try {
+    return fn();
+  } finally {
+    fsMutable.statSync = original;
     syncBuiltinESMExports();
   }
 }
@@ -88,11 +116,29 @@ Press Enter to confirm`;
 const READY_HELPER_CAPTURE = `╭────────────────────────────────────────────╮
 │ >_ OpenAI Codex (v0.114.0)                 │
 │                                            │
-│ model:     gpt-5.4 high   /model to change │
+│ model:     gpt-5.5 high   /model to change │
 │ directory: ~/Workspace/demo                │
 ╰────────────────────────────────────────────╯
 
 How can I help you today?`;
+
+const VIEWPORT_WITHOUT_VISIBLE_PROMPT_CAPTURE = `╭────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.118.0)                 │
+│                                            │
+│ model:     gpt-5.5 high   /model to change │
+│ directory: ~/Workspace/demo                │
+╰────────────────────────────────────────────╯
+
+⚠ MCP startup incomplete (failed: hf request)`;
+
+const VIEWPORT_SCROLLBACK_READY_CAPTURE = `${VIEWPORT_WITHOUT_VISIBLE_PROMPT_CAPTURE}
+
+› support lane on multi-image attach`;
+
+const QUEUED_AFTER_TOOL_CALL_CAPTURE = `• Messages to be submitted after next tool call (press esc to interrupt and send immediately)
+  ↳ Read $OMX_TEAM_STATE_ROOT/team/demo/workers/worker-1/inbox.md, work now, report progress
+
+› Write tests for @filename`;
 
 async function withMockTmuxFixture<T>(
   dirPrefix: string,
@@ -172,13 +218,16 @@ describe('HUD resize hook command builders', () => {
     assert.equal(buildHudPaneTarget('41'), '%41');
   });
 
-  it('buildRegisterResizeHookArgs uses window target and numeric client-resized hook slot', () => {
+  it('buildRegisterResizeHookArgs uses target and numeric client-resized hook slot', () => {
     const args = buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%1');
     assert.equal(args[0], 'set-hook');
     assert.equal(args[1], '-t');
     assert.equal(args[2], 'my-session:0');
     assert.match(args[3] ?? '', /^client-resized\[\d+\]$/);
-    assert.equal(args[4], `run-shell -b 'tmux resize-pane -t %1 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true'`);
+    assert.equal(
+      args[4],
+      `run-shell -b 'tmux resize-pane -t %1 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true; sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; tmux resize-pane -t %1 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true'`,
+    );
   });
 
   it('buildUnregisterResizeHookArgs removes the exact numeric hook slot', () => {
@@ -255,6 +304,90 @@ describe('HUD resize hook command builders', () => {
       ['run-shell', `tmux resize-pane -t %7 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true`],
     );
   });
+
+  it('resolves the tmux executable for win32 hook shell snippets', async () => {
+    const fakeBin = await mkdtemp(join(tmpdir(), 'omx-win32-hook-tmux-'));
+    const prevPath = process.env.PATH;
+    const prevPathext = process.env.PATHEXT;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    try {
+      const tmuxPath = join(fakeBin, 'tmux.exe');
+      await writeFile(tmuxPath, '');
+      process.env.PATH = fakeBin;
+      process.env.PATHEXT = '.EXE';
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+      const resizeArgs = buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%1');
+      const delayedArgs = buildScheduleDelayedHudResizeArgs('%1');
+      const reconcileArgs = buildReconcileHudResizeArgs('%1');
+
+      assert.match(resizeArgs[4] ?? '', new RegExp(escapeRegExp(tmuxPath)));
+      assert.doesNotMatch(resizeArgs[4] ?? '', /^run-shell -b 'tmux resize-pane/);
+      assert.match(delayedArgs[2] ?? '', new RegExp(escapeRegExp(tmuxPath)));
+      assert.doesNotMatch(delayedArgs[2] ?? '', /sleep \d+; tmux resize-pane/);
+      assert.match(reconcileArgs[1] ?? '', new RegExp(escapeRegExp(tmuxPath)));
+      assert.doesNotMatch(reconcileArgs[1] ?? '', /^tmux resize-pane/);
+    } finally {
+      if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+      if (typeof prevPath === 'string') process.env.PATH = prevPath;
+      else delete process.env.PATH;
+      if (typeof prevPathext === 'string') process.env.PATHEXT = prevPathext;
+      else delete process.env.PATHEXT;
+      await rm(fakeBin, { recursive: true, force: true });
+    }
+  });
+
+  it('resolves the tmux executable twice for win32 client-attached one-shot hooks', async () => {
+    const fakeBin = await mkdtemp(join(tmpdir(), 'omx-win32-attached-hook-'));
+    const prevPath = process.env.PATH;
+    const prevPathext = process.env.PATHEXT;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    try {
+      const tmuxPath = join(fakeBin, 'tmux.exe');
+      await writeFile(tmuxPath, '');
+      process.env.PATH = fakeBin;
+      process.env.PATHEXT = '.EXE';
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+      const args = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1');
+      const matches = (args[4] ?? '').match(new RegExp(escapeRegExp(tmuxPath), 'g')) || [];
+      assert.equal(matches.length, 2, 'client-attached hook should resolve tmux for both resize and unregister commands');
+      assert.doesNotMatch(args[4] ?? '', /; tmux set-hook -u -t my-session:0 client-attached/);
+    } finally {
+      if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+      if (typeof prevPath === 'string') process.env.PATH = prevPath;
+      else delete process.env.PATH;
+      if (typeof prevPathext === 'string') process.env.PATHEXT = prevPathext;
+      else delete process.env.PATHEXT;
+      await rm(fakeBin, { recursive: true, force: true });
+    }
+  });
+});
+
+
+describe('evaluateStartupDirectTriggerSafetyCapture', () => {
+  it('allows startup direct triggers on a ready prompt or Codex viewport', () => {
+    assert.deepEqual(evaluateStartupDirectTriggerSafetyCapture(READY_HELPER_CAPTURE, 'codex'), {
+      safe: true,
+      reason: 'ready_prompt',
+    });
+    assert.deepEqual(evaluateStartupDirectTriggerSafetyCapture(VIEWPORT_WITHOUT_VISIBLE_PROMPT_CAPTURE, 'codex'), {
+      safe: true,
+      reason: 'codex_viewport',
+    });
+  });
+
+  it('blocks startup direct triggers through trust and Claude bypass prompts', () => {
+    assert.deepEqual(evaluateStartupDirectTriggerSafetyCapture(`Do you trust the contents of this directory?
+Press enter to continue`, 'codex'), {
+      safe: false,
+      reason: 'trust_prompt',
+    });
+    assert.deepEqual(evaluateStartupDirectTriggerSafetyCapture(CLAUDE_BYPASS_PROMPT_CAPTURE, 'claude'), {
+      safe: false,
+      reason: 'claude_bypass_prompt',
+    });
+  });
 });
 
 describe('sendToWorker validation', () => {
@@ -319,6 +452,293 @@ esac
         assert.notEqual(acceptIndex, -1, `expected bypass acceptance in log:\n${log}`);
         assert.notEqual(submitIndex, -1, `expected worker text submission in log:\n${log}`);
         assert.ok(acceptIndex < submitIndex, `expected bypass acceptance before worker text:\n${log}`);
+      },
+    );
+  });
+
+  it('ignores stale queued-next-tool-call banner text that only survives in scrollback history', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-codex-stale-queued-scrollback-',
+      (logPath) => `#!/bin/sh
+set -eu
+state_dir="$(dirname "${logPath}")"
+text_sent_file="$state_dir/text-sent"
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    if printf '%s\n' "$*" | grep -q -- ' -S -80'; then
+      if [ -f "$text_sent_file" ]; then
+        cat <<'EOF'
+${QUEUED_AFTER_TOOL_CALL_CAPTURE}
+EOF
+      else
+        cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+      fi
+    else
+      cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    fi
+    exit 0
+    ;;
+  send-keys)
+    if [ "\${4:-}" = "-l" ] && [ "\${6:-}" = "check inbox" ]; then
+      : > "$text_sent_file"
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      async ({ logPath }) => {
+        await sendToWorker('omx-team-x', 1, 'check inbox');
+        const log = await readFile(logPath, 'utf-8');
+        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        assert.equal(
+          enterCount,
+          2,
+          `expected only the baseline submit presses when the queued banner is stale scrollback:\n${log}`,
+        );
+        assert.match(log, /capture-pane -t omx-team-x:1 -p/);
+        assert.match(log, /capture-pane -t omx-team-x:1 -p -S -80/);
+      },
+    );
+  });
+
+  it('keeps nudging Codex when the visible pane still shows a live queued-next-tool-call banner', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-codex-visible-queued-submit-',
+      (logPath) => `#!/bin/sh
+set -eu
+state_dir="$(dirname "${logPath}")"
+text_sent_file="$state_dir/text-sent"
+enter_count_file="$state_dir/enter-count"
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    enter_count=0
+    if [ -f "$enter_count_file" ]; then
+      enter_count=$(cat "$enter_count_file")
+    fi
+    if printf '%s\n' "$*" | grep -q -- ' -S -80'; then
+      cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    else
+      if [ "$enter_count" -ge 4 ]; then
+        cat <<'EOF'
+initialized in .
+
+◦ Waiting for background terminal (59s…)
+EOF
+      elif [ -f "$text_sent_file" ]; then
+        cat <<'EOF'
+${QUEUED_AFTER_TOOL_CALL_CAPTURE}
+EOF
+      else
+        cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+      fi
+    fi
+    exit 0
+    ;;
+  send-keys)
+    if [ "\${4:-}" = "-l" ] && [ "\${6:-}" = "check inbox" ]; then
+      : > "$text_sent_file"
+    fi
+    if [ "\${4:-}" = "C-m" ]; then
+      enter_count=0
+      if [ -f "$enter_count_file" ]; then
+        enter_count=$(cat "$enter_count_file")
+      fi
+      enter_count=$((enter_count + 1))
+      printf '%s' "$enter_count" > "$enter_count_file"
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      async ({ logPath }) => {
+        await sendToWorker('omx-team-x', 1, 'check inbox');
+        const log = await readFile(logPath, 'utf-8');
+        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        assert.ok(
+          enterCount >= 4,
+          `expected extra submit nudges when Codex queues the trigger:\n${log}`,
+        );
+      },
+    );
+  });
+
+  it('fails closed when the visible queued-next-tool-call banner never clears after the final submit round', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-codex-stuck-queued-submit-',
+      (logPath) => `#!/bin/sh
+set -eu
+state_dir="$(dirname "${logPath}")"
+text_sent_file="$state_dir/text-sent"
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    if printf '%s\n' "$*" | grep -q -- ' -S -80'; then
+      cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    else
+      if [ -f "$text_sent_file" ]; then
+        cat <<'EOF'
+${QUEUED_AFTER_TOOL_CALL_CAPTURE}
+EOF
+      else
+        cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+      fi
+    fi
+    exit 0
+    ;;
+  send-keys)
+    if [ "\${4:-}" = "-l" ] && [ "\${6:-}" = "check inbox" ]; then
+      : > "$text_sent_file"
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      async ({ logPath }) => {
+        await assert.rejects(
+          () => sendToWorker('omx-team-x', 1, 'check inbox'),
+          /submit_queued_after_tool_call/,
+        );
+        const log = await readFile(logPath, 'utf-8');
+        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        assert.ok(
+          enterCount >= 4,
+          `expected repeated submit nudges before failing closed on stuck queued banner:\n${log}`,
+        );
+      },
+    );
+  });
+
+  it('does not confirm delivery while a wrapped hyphenated trigger remains as an unsent draft', async () => {
+    const trigger = 'Read .omx/state/team/team-x/workers/worker-1/inbox.md';
+    await withMockTmuxFixture(
+      'omx-tmux-codex-wrapped-trigger-draft-',
+      (logPath) => `#!/bin/sh
+set -eu
+state_dir="$(dirname "${logPath}")"
+text_sent_file="$state_dir/text-sent"
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    if [ -f "$text_sent_file" ]; then
+      cat <<'EOF'
+${READY_HELPER_CAPTURE}
+
+› Read .omx/state/team/team-x/workers/worker-
+  1/inbox.md
+EOF
+    else
+      cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    fi
+    exit 0
+    ;;
+  send-keys)
+    if [ "\${4:-}" = "-l" ] && [ "\${6:-}" = "${trigger}" ]; then
+      : > "$text_sent_file"
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      async ({ logPath }) => {
+        await assert.rejects(
+          () => sendToWorker('omx-team-x', 1, trigger),
+          /submit_failed/,
+        );
+        const log = await readFile(logPath, 'utf-8');
+        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        assert.ok(
+          enterCount >= 4,
+          `expected repeated submit nudges before failing on the still-visible wrapped draft:\n${log}`,
+        );
+      },
+    );
+  });
+});
+
+describe('sendToWorker adaptive retry matching', () => {
+  it('recognizes hyphen-wrapped trigger drafts as still visible', () => {
+    assert.equal(
+      shouldAttemptAdaptiveRetry(
+        'auto',
+        true,
+        true,
+        `${READY_HELPER_CAPTURE}\n\n› Read .omx/state/team/team-x/workers/worker-\n  1/inbox.md`,
+        'Read .omx/state/team/team-x/workers/worker-1/inbox.md',
+      ),
+      true,
+    );
+  });
+});
+
+describe('startup direct trigger safety', () => {
+  it('classifies ready panes as safe and blocks trust, bypass, bootstrapping, and active-task captures', () => {
+    assert.equal(classifyWorkerStartupInjectSafety(READY_HELPER_CAPTURE), 'safe');
+    assert.equal(
+      classifyWorkerStartupInjectSafety('Do you trust the contents of this directory?\nPress enter to continue'),
+      'trust_prompt',
+    );
+    assert.equal(classifyWorkerStartupInjectSafety(CLAUDE_BYPASS_PROMPT_CAPTURE), 'claude_bypass_prompt');
+    assert.equal(classifyWorkerStartupInjectSafety('OpenAI Codex\nmodel: loading'), 'bootstrapping');
+    assert.equal(
+      classifyWorkerStartupInjectSafety('OpenAI Codex\nmodel: test\n• Running tests (esc to interrupt)'),
+      'active_task',
+    );
+  });
+
+  it('checks visible pane first and refuses direct injection through a trust prompt', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-startup-direct-trust-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    cat <<'EOF'
+Do you trust the contents of this directory?
+Press enter to continue
+EOF
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      async ({ logPath }) => {
+        assert.deepEqual(
+          await checkWorkerStartupInjectSafety('omx-team-x', 1),
+          { safe: false, reason: 'trust_prompt' },
+        );
+        const log = await readFile(logPath, 'utf-8');
+        assert.doesNotMatch(log, /send-keys/);
       },
     );
   });
@@ -512,6 +932,77 @@ describe('buildWorkerStartupCommand', () => {
     }
   });
 
+  it('scrubs HUD ownership env from interactive worker startup commands', () => {
+    const prevShell = process.env.SHELL;
+    const prevCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevHudOwner = process.env.OMX_TMUX_HUD_OWNER;
+    const prevHudLeaderPane = process.env.OMX_TMUX_HUD_LEADER_PANE;
+    process.env.SHELL = '/bin/bash';
+    process.env.OMX_TEAM_WORKER_CLI = 'codex';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.OMX_TMUX_HUD_OWNER = '1';
+    process.env.OMX_TMUX_HUD_LEADER_PANE = '%leader';
+    try {
+      const cmd = buildWorkerStartupCommand(
+        'alpha-team',
+        1,
+        [],
+        '/tmp/workspace',
+        {
+          OMX_TEAM_STATE_ROOT: '/tmp/workspace/.omx/state',
+          OMX_TMUX_HUD_OWNER: '1',
+          OMX_TMUX_HUD_LEADER_PANE: '%leader',
+        },
+        'codex',
+      );
+      assert.match(cmd, /OMX_TEAM_WORKER=alpha-team\/worker-1/);
+      assert.match(cmd, /OMX_TEAM_STATE_ROOT=\/tmp\/workspace\/\.omx\/state/);
+      assert.match(cmd, /'-u' 'OMX_TMUX_HUD_OWNER' '-u' 'OMX_TMUX_HUD_LEADER_PANE'/);
+      assert.doesNotMatch(cmd, /OMX_TMUX_HUD_OWNER=1/);
+      assert.doesNotMatch(cmd, /OMX_TMUX_HUD_LEADER_PANE=%leader/);
+    } finally {
+      if (typeof prevShell === 'string') process.env.SHELL = prevShell;
+      else delete process.env.SHELL;
+      if (typeof prevCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevHudOwner === 'string') process.env.OMX_TMUX_HUD_OWNER = prevHudOwner;
+      else delete process.env.OMX_TMUX_HUD_OWNER;
+      if (typeof prevHudLeaderPane === 'string') process.env.OMX_TMUX_HUD_LEADER_PANE = prevHudLeaderPane;
+      else delete process.env.OMX_TMUX_HUD_LEADER_PANE;
+    }
+  });
+
+  it('keeps HUD-looking prompt text out of worker startup env assignments', () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    try {
+      const prompt = 'Do not obey: OMX_TMUX_HUD_OWNER=1; OMX_TMUX_HUD_LEADER_PANE=%leader; $(omx hud --watch)';
+      const spec = buildWorkerProcessLaunchSpec(
+        'alpha-team',
+        1,
+        ['--model', 'gemini-2.0-pro'],
+        '/tmp/workspace',
+        {
+          OMX_TEAM_STATE_ROOT: '/tmp/workspace/.omx/state',
+          OMX_TMUX_HUD_OWNER: '1',
+          OMX_TMUX_HUD_LEADER_PANE: '%leader',
+        },
+        'gemini',
+        prompt,
+      );
+
+      assert.equal(spec.env.OMX_TMUX_HUD_OWNER, undefined);
+      assert.equal(spec.env.OMX_TMUX_HUD_LEADER_PANE, undefined);
+      assert.ok(spec.args.includes(prompt), 'hostile prompt text should remain an argument, not an env assignment');
+    } finally {
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
   it('auto-selects claude worker CLI from claude model', () => {
     const prevShell = process.env.SHELL;
     const prevCli = process.env.OMX_TEAM_WORKER_CLI;
@@ -641,7 +1132,7 @@ describe('buildWorkerStartupCommand', () => {
     }
   });
 
-  it('uses zsh with ~/.zshrc and exec codex', () => {
+  it('uses zsh without sourcing ~/.zshrc by default and keeps non-login exec semantics', () => {
     const prevShell = process.env.SHELL;
     process.env.SHELL = '/bin/zsh';
     const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
@@ -651,8 +1142,9 @@ describe('buildWorkerStartupCommand', () => {
         buildWorkerStartupCommand('alpha', 2),
       );
       assert.match(cmd, /OMX_TEAM_WORKER=alpha\/worker-2/);
-      assert.match(cmd, /'\/bin\/zsh' -lc/);
-      assert.match(cmd, /source ~\/\.zshrc/);
+      assert.match(cmd, /'\/bin\/zsh' -c/);
+      assert.doesNotMatch(cmd, /'\/bin\/zsh' -lc\b/);
+      assert.doesNotMatch(cmd, /source ~\/\.zshrc/);
       assert.match(cmd, /exec .*codex/);
     } finally {
       if (typeof prevShell === 'string') process.env.SHELL = prevShell;
@@ -662,14 +1154,54 @@ describe('buildWorkerStartupCommand', () => {
     }
   });
 
-  it('uses bash with ~/.bashrc and preserves launch args', () => {
+  it('accepts Homebrew zsh as a supported worker shell without falling back', () => {
+    const prevShell = process.env.SHELL;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    process.env.SHELL = '/opt/homebrew/bin/zsh';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    try {
+      const cmd = withMockedExistsSync((candidate) => candidate === '/opt/homebrew/bin/zsh', () =>
+        buildWorkerStartupCommand('alpha', 2),
+      );
+      assert.match(cmd, /'\/opt\/homebrew\/bin\/zsh' -c/);
+      assert.doesNotMatch(cmd, /'\/bin\/sh' -c/);
+      assert.doesNotMatch(cmd, /source ~\/\.zshrc/);
+    } finally {
+      if (typeof prevShell === 'string') process.env.SHELL = prevShell;
+      else delete process.env.SHELL;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
+  it('accepts MacPorts zsh as a supported worker shell without falling back', () => {
+    const prevShell = process.env.SHELL;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    process.env.SHELL = '/opt/local/bin/zsh';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    try {
+      const cmd = withMockedExistsSync((candidate) => candidate === '/opt/local/bin/zsh', () =>
+        buildWorkerStartupCommand('alpha', 2),
+      );
+      assert.match(cmd, /'\/opt\/local\/bin\/zsh' -c/);
+      assert.doesNotMatch(cmd, /'\/bin\/sh' -c/);
+      assert.doesNotMatch(cmd, /source ~\/\.zshrc/);
+    } finally {
+      if (typeof prevShell === 'string') process.env.SHELL = prevShell;
+      else delete process.env.SHELL;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
+  it('prevents issue #2358 bash rc fan-out by default and preserves launch args', () => {
     const prevShell = process.env.SHELL;
     process.env.SHELL = '/bin/bash';
     const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
     process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
     try {
       const cmd = buildWorkerStartupCommand('alpha', 1, ['--model', 'gpt-5']);
-      assert.match(cmd, /source ~\/\.bashrc/);
+      assert.doesNotMatch(cmd, /source ~\/\.bashrc/);
       assert.match(cmd, /exec .*codex/);
       assert.match(cmd, /--model/);
       assert.match(cmd, /gpt-5/);
@@ -678,6 +1210,49 @@ describe('buildWorkerStartupCommand', () => {
       else delete process.env.SHELL;
       if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
       else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
+  it('sources worker shell rc files only when explicitly opted in', () => {
+    const prevShell = process.env.SHELL;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevSourceRc = process.env.OMX_TMUX_SOURCE_SHELL_RC;
+    process.env.SHELL = '/bin/bash';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    try {
+      delete process.env.OMX_TMUX_SOURCE_SHELL_RC;
+      assert.equal(shouldSourceTeamWorkerShellRc(process.env), false);
+      assert.doesNotMatch(
+        buildWorkerStartupCommand('alpha', 1, ['--model', 'gpt-5']),
+        /source ~\/\.bashrc/,
+      );
+
+      process.env.OMX_TMUX_SOURCE_SHELL_RC = '1';
+      assert.equal(shouldSourceTeamWorkerShellRc(process.env), true);
+      assert.match(
+        buildWorkerStartupCommand('alpha', 1, ['--model', 'gpt-5']),
+        /source ~\/\.bashrc/,
+      );
+
+      delete process.env.OMX_TMUX_SOURCE_SHELL_RC;
+      assert.match(
+        buildWorkerStartupCommand(
+          'alpha',
+          1,
+          ['--model', 'gpt-5'],
+          process.cwd(),
+          { OMX_TMUX_SOURCE_SHELL_RC: '1' },
+        ),
+        /source ~\/\.bashrc/,
+        'per-worker explicit opt-in should be honored',
+      );
+    } finally {
+      if (typeof prevShell === 'string') process.env.SHELL = prevShell;
+      else delete process.env.SHELL;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevSourceRc === 'string') process.env.OMX_TMUX_SOURCE_SHELL_RC = prevSourceRc;
+      else delete process.env.OMX_TMUX_SOURCE_SHELL_RC;
     }
   });
 
@@ -704,6 +1279,291 @@ describe('buildWorkerStartupCommand', () => {
       else delete process.env.SHELL;
       if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
       else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
+  it('uses a generated startup script with MSYS paths on win32/MSYS', async () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const prevMsystem = process.env.MSYSTEM;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const stateRoot = 'C:\\omx-state';
+    try {
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      process.env.MSYSTEM = 'MINGW64';
+      process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+      const cmd = writeWorkerStartupScriptCommand(
+        'alpha',
+        1,
+        ['--model', 'gpt-5'],
+        'C:\\repo',
+        { OMX_TEAM_STATE_ROOT: stateRoot },
+        'gemini',
+      );
+      assert.equal(cmd, `exec /bin/sh '/c/omx-state/team/alpha/runtime/worker-1-startup.sh'`);
+      const script = await readFile(join(stateRoot, 'team', 'alpha', 'runtime', 'worker-1-startup.sh'), 'utf-8');
+      assert.match(script, /^cd '\/c\/repo'$/m);
+      assert.match(script, /^exec '\/bin\/sh' -c /m);
+    } finally {
+      await rm(stateRoot, { recursive: true, force: true });
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
+  it('does not emit cmd.exe flag wrappers for MSYS startup scripts with cmd shims', async () => {
+    const fakeRoot = await mkdtemp(join(tmpdir(), 'omx-worker-startup-msys-cmd-shim-'));
+    const fakeBin = join(fakeRoot, 'bin dir');
+    const stateRoot = join(fakeRoot, 'state root');
+    const startupScriptPath = join(stateRoot, 'team', 'alpha', 'runtime', 'worker-1-startup.sh');
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const prevPath = process.env.PATH;
+    const prevPathext = process.env.PATHEXT;
+    const prevMsystem = process.env.MSYSTEM;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    try {
+      await mkdir(fakeBin, { recursive: true });
+      const geminiCmdPath = join(fakeBin, 'gemini.cmd');
+      await writeFile(geminiCmdPath, '@echo off\r\n');
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      process.env.PATH = fakeBin;
+      process.env.PATHEXT = '.CMD';
+      process.env.MSYSTEM = 'MINGW64';
+      process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+
+      const cmd = writeWorkerStartupScriptCommand(
+        'alpha',
+        1,
+        ['--model', 'gemini-2.5-pro'],
+        'C:\\repo with space',
+        { OMX_TEAM_STATE_ROOT: stateRoot },
+        'gemini',
+      );
+
+      assert.equal(cmd, `exec /bin/sh '${startupScriptPath}'`);
+      const script = await readFile(startupScriptPath, 'utf-8');
+      assert.doesNotMatch(script, /cmd\.exe/i);
+      assert.doesNotMatch(script, /'\/d'|'\/s'|'\/c'|\s\/d\s|\s\/s\s|\s\/c\s/i);
+      assert.match(script, /^cd '\/c\/repo with space'$/m);
+      assert.match(script, /^exec '\/bin\/sh' -c /m);
+      assert.match(script, new RegExp(escapeRegExp(geminiCmdPath)));
+      assert.match(script, /--approval-mode/);
+      assert.match(script, /yolo/);
+    } finally {
+      await rm(fakeRoot, { recursive: true, force: true });
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+      if (typeof prevPath === 'string') process.env.PATH = prevPath;
+      else delete process.env.PATH;
+      if (typeof prevPathext === 'string') process.env.PATHEXT = prevPathext;
+      else delete process.env.PATHEXT;
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
+  it('wraps MSYS prompt worker cmd shims for shell-free Windows spawn', async () => {
+    const fakeRoot = await mkdtemp(join(tmpdir(), 'omx-worker-process-msys-bat-shim-'));
+    const fakeBin = join(fakeRoot, 'bin dir');
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const prevPath = process.env.PATH;
+    const prevPathext = process.env.PATHEXT;
+    const prevMsystem = process.env.MSYSTEM;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevComSpec = process.env.ComSpec;
+    try {
+      await mkdir(fakeBin, { recursive: true });
+      const geminiBatPath = join(fakeBin, 'gemini.bat');
+      await writeFile(geminiBatPath, '@echo off\r\n');
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      process.env.PATH = fakeBin;
+      process.env.PATHEXT = '.BAT';
+      process.env.MSYSTEM = 'MINGW64';
+      process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+      process.env.ComSpec = 'C:\\Windows\\System32\\cmd.exe';
+
+      const spec = buildWorkerProcessLaunchSpec(
+        'alpha',
+        1,
+        ['--model', 'gemini-2.5-pro'],
+        'C:\\repo with space',
+        {},
+        'gemini',
+      );
+
+      assert.equal(spec.command, 'C:\\Windows\\System32\\cmd.exe');
+      assert.deepEqual(spec.args.slice(0, 3), ['/d', '/s', '/c']);
+      assert.match(spec.args[3] ?? '', new RegExp(escapeRegExp(geminiBatPath)));
+      assert.match(spec.args[3] ?? '', /--approval-mode/);
+      assert.match(spec.args[3] ?? '', /yolo/);
+      assert.equal(spec.env.OMX_LEADER_CLI_PATH, geminiBatPath);
+      assert.notEqual(spec.command, geminiBatPath);
+    } finally {
+      await rm(fakeRoot, { recursive: true, force: true });
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+      if (typeof prevPath === 'string') process.env.PATH = prevPath;
+      else delete process.env.PATH;
+      if (typeof prevPathext === 'string') process.env.PATHEXT = prevPathext;
+      else delete process.env.PATHEXT;
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevComSpec === 'string') process.env.ComSpec = prevComSpec;
+      else delete process.env.ComSpec;
+    }
+  });
+
+  it('writes a short worker startup script under team runtime state when available', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-worker-startup-script-'));
+    const stateRoot = join(wd, '.omx', 'state');
+    const prevShell = process.env.SHELL;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevHudOwner = process.env.OMX_TMUX_HUD_OWNER;
+    const prevHudLeaderPane = process.env.OMX_TMUX_HUD_LEADER_PANE;
+    process.env.SHELL = '/bin/bash';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.OMX_TMUX_HUD_OWNER = '1';
+    process.env.OMX_TMUX_HUD_LEADER_PANE = '%leader';
+    try {
+      const cmd = writeWorkerStartupScriptCommand(
+        'alpha',
+        1,
+        ['--model', 'gpt-5'],
+        wd,
+        {
+          OMX_TEAM_STATE_ROOT: stateRoot,
+          OMX_TEAM_LEADER_CWD: wd,
+          OMX_TMUX_HUD_OWNER: '1',
+          OMX_TMUX_HUD_LEADER_PANE: '%leader',
+        },
+        'gemini',
+      );
+      assert.equal(cmd, `exec /bin/sh '${stateRoot}/team/alpha/runtime/worker-1-startup.sh'`);
+      const script = await readFile(join(stateRoot, 'team', 'alpha', 'runtime', 'worker-1-startup.sh'), 'utf-8');
+      assert.match(script, /^#!\/bin\/sh/m);
+      assert.match(script, new RegExp(`cd '${wd.replace(/'/g, `'\\\\''`)}'`));
+      assert.match(script, /^unset OMX_TMUX_HUD_OWNER OMX_TMUX_HUD_LEADER_PANE$/m);
+      assert.match(script, /export OMX_TEAM_STATE_ROOT=/);
+      assert.doesNotMatch(script, /^export OMX_TMUX_HUD_OWNER=/m);
+      assert.doesNotMatch(script, /^export OMX_TMUX_HUD_LEADER_PANE=/m);
+      assert.match(script, /exec '\/bin\/bash' -c /);
+      assert.doesNotMatch(cmd ?? '', /OMX_TEAM_STATE_ROOT=/, 'tmux command should point at script instead of inlining env');
+    } finally {
+      if (typeof prevShell === 'string') process.env.SHELL = prevShell;
+      else delete process.env.SHELL;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevHudOwner === 'string') process.env.OMX_TMUX_HUD_OWNER = prevHudOwner;
+      else delete process.env.OMX_TMUX_HUD_OWNER;
+      if (typeof prevHudLeaderPane === 'string') process.env.OMX_TMUX_HUD_LEADER_PANE = prevHudLeaderPane;
+      else delete process.env.OMX_TMUX_HUD_LEADER_PANE;
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('trusts worktree .mise.toml before worker launch when mise is available', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-worker-mise-trust-'));
+    const fakeBin = join(wd, 'bin');
+    const logPath = join(wd, 'mise.log');
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(join(wd, '.mise.toml'), '[tools]\nnode = "latest"\n');
+      await writeFile(
+        join(fakeBin, 'mise'),
+        `#!/bin/sh\nprintf '%s\\n' "$*" >> '${logPath}'\nexit 0\n`,
+      );
+      await chmod(join(fakeBin, 'mise'), 0o755);
+      process.env.PATH = `${fakeBin}:${previousPath ?? ''}`;
+      assert.equal(trustWorkerMiseConfigIfAvailable(wd), true);
+      assert.match(await readFile(logPath, 'utf-8'), new RegExp(`trust --yes ${wd.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\/\\.mise\\.toml`));
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails soft when .mise.toml exists but mise is unavailable', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-worker-mise-missing-'));
+    try {
+      await writeFile(join(wd, '.mise.toml'), '[tools]\nnode = "latest"\n');
+      withEmptyPath(() => {
+        assert.equal(trustWorkerMiseConfigIfAvailable(wd), false);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('inherits only allowlisted ambient proxy env vars for tmux startup commands', () => {
+    const prevShell = process.env.SHELL;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevHttpsProxy = process.env.HTTPS_PROXY;
+    const prevHttpProxy = process.env.HTTP_PROXY;
+    const prevNoProxy = process.env.NO_PROXY;
+    const prevLowerHttpsProxy = process.env.https_proxy;
+    const prevCustom = process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.SHELL = '/bin/bash';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.HTTPS_PROXY = 'https://upper-proxy.example:443';
+    process.env.HTTP_PROXY = 'http://upper-proxy.example:80';
+    process.env.NO_PROXY = 'localhost,127.0.0.1';
+    process.env.https_proxy = 'https://lower-proxy.example:443';
+    process.env.AWS_SECRET_ACCESS_KEY = 'should-not-inherit';
+    try {
+      const cmd = buildWorkerStartupCommand('alpha', 1, [], '/tmp/project');
+      assert.match(cmd, /HTTPS_PROXY=https:\/\/upper-proxy\.example:443/);
+      assert.match(cmd, /HTTP_PROXY=http:\/\/upper-proxy\.example:80/);
+      assert.match(cmd, /NO_PROXY=localhost,127\.0\.0\.1/);
+      assert.match(cmd, /https_proxy=https:\/\/lower-proxy\.example:443/);
+      assert.doesNotMatch(cmd, /AWS_SECRET_ACCESS_KEY=should-not-inherit/);
+    } finally {
+      if (typeof prevShell === 'string') process.env.SHELL = prevShell;
+      else delete process.env.SHELL;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevHttpsProxy === 'string') process.env.HTTPS_PROXY = prevHttpsProxy;
+      else delete process.env.HTTPS_PROXY;
+      if (typeof prevHttpProxy === 'string') process.env.HTTP_PROXY = prevHttpProxy;
+      else delete process.env.HTTP_PROXY;
+      if (typeof prevNoProxy === 'string') process.env.NO_PROXY = prevNoProxy;
+      else delete process.env.NO_PROXY;
+      if (typeof prevLowerHttpsProxy === 'string') process.env.https_proxy = prevLowerHttpsProxy;
+      else delete process.env.https_proxy;
+      if (typeof prevCustom === 'string') process.env.AWS_SECRET_ACCESS_KEY = prevCustom;
+      else delete process.env.AWS_SECRET_ACCESS_KEY;
+    }
+  });
+
+  it('preserves explicit worker env precedence over inherited ambient proxy vars', () => {
+    const prevShell = process.env.SHELL;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevHttpsProxy = process.env.HTTPS_PROXY;
+    process.env.SHELL = '/bin/bash';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.HTTPS_PROXY = 'https://ambient-proxy.example:443';
+    try {
+      const cmd = buildWorkerStartupCommand(
+        'alpha',
+        1,
+        [],
+        '/tmp/project',
+        { HTTPS_PROXY: 'https://explicit-proxy.example:8443' },
+      );
+      assert.match(cmd, /HTTPS_PROXY=https:\/\/explicit-proxy\.example:8443/);
+      assert.doesNotMatch(cmd, /HTTPS_PROXY=https:\/\/ambient-proxy\.example:443/);
+    } finally {
+      if (typeof prevShell === 'string') process.env.SHELL = prevShell;
+      else delete process.env.SHELL;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevHttpsProxy === 'string') process.env.HTTPS_PROXY = prevHttpsProxy;
+      else delete process.env.HTTPS_PROXY;
     }
   });
 
@@ -735,7 +1595,7 @@ describe('buildWorkerStartupCommand', () => {
 
       assert.match(cmd, new RegExp(escapeRegExp(`OMX_LEADER_NODE_PATH=${nodePath}`)));
       assert.match(cmd, new RegExp(escapeRegExp(`OMX_LEADER_CLI_PATH=${codexPath}`)));
-      assert.match(cmd, new RegExp(escapeRegExp(`export PATH='\\''${fakeBin}'\\'':$PATH; exec ${codexPath}`)));
+      assert.match(cmd, new RegExp(escapeRegExp(`export PATH='\\''${fakeBin}'\\'':$PATH; exec '\\''${codexPath}'\\''`)));
       assert.doesNotMatch(cmd, /export PATH='\\''node'\\'':\$PATH/);
       assert.doesNotMatch(cmd, / exec codex(?:\s|')/);
     } finally {
@@ -903,6 +1763,85 @@ describe('buildWorkerStartupCommand', () => {
     }
   });
 
+
+  it('does not synthesize absent first-party OMX MCP server tables for Codex team workers', async () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevCompat = process.env.OMX_TEAM_WORKER_MCP_COMPAT;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const codexHome = await mkdtemp(join(tmpdir(), 'omx-team-no-mcp-config-'));
+    try {
+      await writeFile(join(codexHome, 'config.toml'), '[mcp_servers.gitnexus]\ncommand = "gitnexus"\n');
+      process.env.CODEX_HOME = codexHome;
+      process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+      delete process.env.OMX_TEAM_WORKER_MCP_COMPAT;
+      const cmd = buildWorkerStartupCommand('alpha', 1, [], '/tmp/project', {}, 'codex');
+      for (const server of ['omx_state', 'omx_memory', 'omx_code_intel', 'omx_trace', 'omx_wiki', 'omx_hermes']) {
+        assert.doesNotMatch(cmd, new RegExp(`mcp_servers\\.${server}\\.enabled=false`));
+      }
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevCompat === 'string') process.env.OMX_TEAM_WORKER_MCP_COMPAT = prevCompat;
+      else delete process.env.OMX_TEAM_WORKER_MCP_COMPAT;
+      if (typeof prevCodexHome === 'string') process.env.CODEX_HOME = prevCodexHome;
+      else delete process.env.CODEX_HOME;
+    }
+  });
+
+  it('disables configured first-party OMX MCP compatibility servers for Codex team workers by default', async () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevCompat = process.env.OMX_TEAM_WORKER_MCP_COMPAT;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const codexHome = await mkdtemp(join(tmpdir(), 'omx-team-mcp-config-'));
+    try {
+      await writeFile(
+        join(codexHome, 'config.toml'),
+        ['omx_state', 'omx_memory', 'omx_code_intel', 'omx_trace', 'omx_wiki', 'omx_hermes']
+          .map((server) => `[mcp_servers.${server}]\ncommand = "omx"\nargs = ["mcp-serve", "${server}"]\n`)
+          .join('\n'),
+      );
+      process.env.CODEX_HOME = codexHome;
+      process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+      delete process.env.OMX_TEAM_WORKER_MCP_COMPAT;
+      const cmd = buildWorkerStartupCommand('alpha', 1, [], '/tmp/project', {}, 'codex');
+      for (const server of ['omx_state', 'omx_memory', 'omx_code_intel', 'omx_trace', 'omx_wiki', 'omx_hermes']) {
+        assert.match(cmd, new RegExp(`mcp_servers\\.${server}\\.enabled=false`));
+      }
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevCompat === 'string') process.env.OMX_TEAM_WORKER_MCP_COMPAT = prevCompat;
+      else delete process.env.OMX_TEAM_WORKER_MCP_COMPAT;
+      if (typeof prevCodexHome === 'string') process.env.CODEX_HOME = prevCodexHome;
+      else delete process.env.CODEX_HOME;
+    }
+  });
+
+  it('preserves explicit team-worker MCP compatibility opt-in', async () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevCompat = process.env.OMX_TEAM_WORKER_MCP_COMPAT;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const codexHome = await mkdtemp(join(tmpdir(), 'omx-team-mcp-compat-'));
+    try {
+      await writeFile(join(codexHome, 'config.toml'), '[mcp_servers.omx_state]\ncommand = "omx"\n');
+      process.env.CODEX_HOME = codexHome;
+      process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+      process.env.OMX_TEAM_WORKER_MCP_COMPAT = '1';
+      const cmd = buildWorkerStartupCommand('alpha', 1, [], '/tmp/project', {}, 'codex');
+      assert.doesNotMatch(cmd, /mcp_servers\.omx_state\.enabled=false/);
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevCompat === 'string') process.env.OMX_TEAM_WORKER_MCP_COMPAT = prevCompat;
+      else delete process.env.OMX_TEAM_WORKER_MCP_COMPAT;
+      if (typeof prevCodexHome === 'string') process.env.CODEX_HOME = prevCodexHome;
+      else delete process.env.CODEX_HOME;
+    }
+  });
+
   it('does not inject model_instructions_file override when disabled', () => {
     const prevShell = process.env.SHELL;
     process.env.SHELL = '/bin/bash';
@@ -1027,6 +1966,259 @@ describe('buildWorkerStartupCommand', () => {
     }
   });
 
+  it('uses a native PowerShell startup command on native Windows instead of /bin/sh -lc', async () => {
+    const fakeBin = await mkdtemp(join(tmpdir(), 'omx-worker-startup-win32-'));
+    const prevPath = process.env.PATH;
+    const prevPathext = process.env.PATHEXT;
+    const prevShell = process.env.SHELL;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevLeaderNodePath = process.env.OMX_LEADER_NODE_PATH;
+    const prevMsystem = process.env.MSYSTEM;
+    const prevOstype = process.env.OSTYPE;
+    const prevWsl = process.env.WSL_DISTRO_NAME;
+    const prevWslInterop = process.env.WSL_INTEROP;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    process.env.PATH = fakeBin;
+    process.env.PATHEXT = '.PS1';
+    process.env.SHELL = '/bin/zsh';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.OMX_LEADER_NODE_PATH = 'C:\\Program Files\\nodejs\\node.exe';
+    delete process.env.MSYSTEM;
+    delete process.env.OSTYPE;
+    delete process.env.WSL_DISTRO_NAME;
+    delete process.env.WSL_INTEROP;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      const codexPs1Path = join(fakeBin, 'codex.ps1');
+      await writeFile(codexPs1Path, '');
+
+      const cmd = buildWorkerStartupCommand('alpha', 1, ['--model', 'gpt-5'], 'C:\\repo');
+      assert.doesNotMatch(cmd, /\/bin\/sh -lc/, 'native Windows workers must not launch through POSIX sh');
+      assert.match(cmd, /^powershell\.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand /);
+
+      const encoded = cmd.replace(/^powershell\.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand /, '');
+      const decoded = Buffer.from(encoded, 'base64').toString('utf16le');
+      assert.match(decoded, /\$env:PATH = 'C:\\Program Files\\nodejs;' \+ \$env:PATH/);
+      assert.match(decoded, /\$env:OMX_TEAM_WORKER = 'alpha\/worker-1'/);
+      assert.match(decoded, new RegExp(escapeRegExp(`'-File' '${codexPs1Path}'`)));
+      assert.match(decoded, /'--model' 'gpt-5'/);
+      assert.match(decoded, /'--dangerously-bypass-approvals-and-sandbox'/);
+    } finally {
+      if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+      if (typeof prevPath === 'string') process.env.PATH = prevPath;
+      else delete process.env.PATH;
+      if (typeof prevPathext === 'string') process.env.PATHEXT = prevPathext;
+      else delete process.env.PATHEXT;
+      if (typeof prevShell === 'string') process.env.SHELL = prevShell;
+      else delete process.env.SHELL;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevLeaderNodePath === 'string') process.env.OMX_LEADER_NODE_PATH = prevLeaderNodePath;
+      else delete process.env.OMX_LEADER_NODE_PATH;
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevOstype === 'string') process.env.OSTYPE = prevOstype;
+      else delete process.env.OSTYPE;
+      if (typeof prevWsl === 'string') process.env.WSL_DISTRO_NAME = prevWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof prevWslInterop === 'string') process.env.WSL_INTEROP = prevWslInterop;
+      else delete process.env.WSL_INTEROP;
+      await rm(fakeBin, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the resolved PowerShell executable path in native Windows startup commands', async () => {
+    const fakeBin = await mkdtemp(join(tmpdir(), 'omx-worker-startup-win32-powershell-'));
+    const prevPath = process.env.PATH;
+    const prevPathext = process.env.PATHEXT;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevLeaderNodePath = process.env.OMX_LEADER_NODE_PATH;
+    const prevMsystem = process.env.MSYSTEM;
+    const prevOstype = process.env.OSTYPE;
+    const prevWsl = process.env.WSL_DISTRO_NAME;
+    const prevWslInterop = process.env.WSL_INTEROP;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    process.env.PATH = fakeBin;
+    process.env.PATHEXT = '.EXE;.PS1';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.OMX_LEADER_NODE_PATH = 'C:\\Program Files\\nodejs\\node.exe';
+    delete process.env.MSYSTEM;
+    delete process.env.OSTYPE;
+    delete process.env.WSL_DISTRO_NAME;
+    delete process.env.WSL_INTEROP;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      const codexPs1Path = join(fakeBin, 'codex.ps1');
+      const powershellExePath = join(fakeBin, 'powershell.exe');
+      await writeFile(codexPs1Path, '');
+      await writeFile(powershellExePath, '');
+
+      const cmd = buildWorkerStartupCommand('alpha', 1, ['--model', 'gpt-5'], 'C:\\repo');
+      const prefix = `${powershellExePath} -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand `;
+      assert.ok(cmd.startsWith(prefix), cmd);
+    } finally {
+      if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+      if (typeof prevPath === 'string') process.env.PATH = prevPath;
+      else delete process.env.PATH;
+      if (typeof prevPathext === 'string') process.env.PATHEXT = prevPathext;
+      else delete process.env.PATHEXT;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevLeaderNodePath === 'string') process.env.OMX_LEADER_NODE_PATH = prevLeaderNodePath;
+      else delete process.env.OMX_LEADER_NODE_PATH;
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevOstype === 'string') process.env.OSTYPE = prevOstype;
+      else delete process.env.OSTYPE;
+      if (typeof prevWsl === 'string') process.env.WSL_DISTRO_NAME = prevWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof prevWslInterop === 'string') process.env.WSL_INTEROP = prevWslInterop;
+      else delete process.env.WSL_INTEROP;
+      await rm(fakeBin, { recursive: true, force: true });
+    }
+  });
+
+  it('prefers a no-space native Windows PowerShell path when one is available', async () => {
+    const fakeBin = await mkdtemp(join(tmpdir(), 'omx-worker-startup-win32-nospace-powershell-'));
+    const prevPath = process.env.PATH;
+    const prevPathext = process.env.PATHEXT;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevLeaderNodePath = process.env.OMX_LEADER_NODE_PATH;
+    const prevSystemRoot = process.env.SystemRoot;
+    const prevSYSTEMROOT = process.env.SYSTEMROOT;
+    const prevWindir = process.env.windir;
+    const prevWINDIR = process.env.WINDIR;
+    const prevMsystem = process.env.MSYSTEM;
+    const prevOstype = process.env.OSTYPE;
+    const prevWsl = process.env.WSL_DISTRO_NAME;
+    const prevWslInterop = process.env.WSL_INTEROP;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    process.env.PATH = fakeBin;
+    process.env.PATHEXT = '.EXE;.PS1';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.OMX_LEADER_NODE_PATH = 'C:\\Program Files\\nodejs\\node.exe';
+    process.env.SystemRoot = 'C:\\Windows';
+    delete process.env.SYSTEMROOT;
+    delete process.env.windir;
+    delete process.env.WINDIR;
+    delete process.env.MSYSTEM;
+    delete process.env.OSTYPE;
+    delete process.env.WSL_DISTRO_NAME;
+    delete process.env.WSL_INTEROP;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      const codexPs1Path = join(fakeBin, 'codex.ps1');
+      const pathPowerShellExe = join(fakeBin, 'powershell.exe');
+      const windowsPowerShellExe = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+      await writeFile(codexPs1Path, '');
+      await writeFile(pathPowerShellExe, '');
+
+      const cmd = withMockedExistsSync((candidate) =>
+        candidate === windowsPowerShellExe
+        || candidate === pathPowerShellExe
+        || candidate === codexPs1Path,
+      () => buildWorkerStartupCommand('alpha', 1, ['--model', 'gpt-5'], 'C:\\repo'));
+      const prefix = `${windowsPowerShellExe} -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand `;
+      assert.ok(cmd.startsWith(prefix), cmd);
+      assert.ok(!cmd.startsWith(`${pathPowerShellExe} `), cmd);
+    } finally {
+      if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+      if (typeof prevPath === 'string') process.env.PATH = prevPath;
+      else delete process.env.PATH;
+      if (typeof prevPathext === 'string') process.env.PATHEXT = prevPathext;
+      else delete process.env.PATHEXT;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevLeaderNodePath === 'string') process.env.OMX_LEADER_NODE_PATH = prevLeaderNodePath;
+      else delete process.env.OMX_LEADER_NODE_PATH;
+      if (typeof prevSystemRoot === 'string') process.env.SystemRoot = prevSystemRoot;
+      else delete process.env.SystemRoot;
+      if (typeof prevSYSTEMROOT === 'string') process.env.SYSTEMROOT = prevSYSTEMROOT;
+      else delete process.env.SYSTEMROOT;
+      if (typeof prevWindir === 'string') process.env.windir = prevWindir;
+      else delete process.env.windir;
+      if (typeof prevWINDIR === 'string') process.env.WINDIR = prevWINDIR;
+      else delete process.env.WINDIR;
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevOstype === 'string') process.env.OSTYPE = prevOstype;
+      else delete process.env.OSTYPE;
+      if (typeof prevWsl === 'string') process.env.WSL_DISTRO_NAME = prevWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof prevWslInterop === 'string') process.env.WSL_INTEROP = prevWslInterop;
+      else delete process.env.WSL_INTEROP;
+      await rm(fakeBin, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the resolved node-hosted Codex launcher in native Windows startup commands', async () => {
+    const fakeRoot = await mkdtemp(join(tmpdir(), 'omx-worker-startup-win32-node-hosted-'));
+    const fakeBin = join(fakeRoot, 'node_modules', '.bin');
+    const prevPath = process.env.PATH;
+    const prevPathext = process.env.PATHEXT;
+    const prevShell = process.env.SHELL;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevLeaderNodePath = process.env.OMX_LEADER_NODE_PATH;
+    const prevMsystem = process.env.MSYSTEM;
+    const prevOstype = process.env.OSTYPE;
+    const prevWsl = process.env.WSL_DISTRO_NAME;
+    const prevWslInterop = process.env.WSL_INTEROP;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    process.env.PATH = fakeBin;
+    process.env.PATHEXT = '.CMD;.PS1';
+    process.env.SHELL = '/bin/zsh';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.OMX_LEADER_NODE_PATH = 'C:\\Program Files\\nodejs\\node.exe';
+    delete process.env.MSYSTEM;
+    delete process.env.OSTYPE;
+    delete process.env.WSL_DISTRO_NAME;
+    delete process.env.WSL_INTEROP;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      const codexCmdPath = join(fakeBin, 'codex.cmd');
+      const codexJsPath = join(fakeRoot, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+      await mkdir(fakeBin, { recursive: true });
+      await mkdir(join(fakeRoot, 'node_modules', '@openai', 'codex', 'bin'), { recursive: true });
+      await writeFile(codexCmdPath, '@echo off\r\n');
+      await writeFile(codexJsPath, '');
+
+      const cmd = buildWorkerStartupCommand('alpha', 1, ['--model', 'gpt-5'], 'C:\\repo');
+      const prefix = 'powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand ';
+      assert.ok(cmd.startsWith(prefix));
+
+      const decoded = Buffer.from(cmd.slice(prefix.length), 'base64').toString('utf16le');
+      assert.match(decoded, new RegExp(escapeRegExp(`$env:OMX_LEADER_CLI_PATH = '${codexJsPath}'`)));
+      assert.match(
+        decoded,
+        new RegExp(
+          escapeRegExp(`& '${process.execPath}' '${codexJsPath}' '--model' 'gpt-5' '--dangerously-bypass-approvals-and-sandbox'`),
+        ),
+      );
+      assert.doesNotMatch(decoded, new RegExp(escapeRegExp(codexCmdPath)));
+    } finally {
+      if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+      if (typeof prevPath === 'string') process.env.PATH = prevPath;
+      else delete process.env.PATH;
+      if (typeof prevPathext === 'string') process.env.PATHEXT = prevPathext;
+      else delete process.env.PATHEXT;
+      if (typeof prevShell === 'string') process.env.SHELL = prevShell;
+      else delete process.env.SHELL;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevLeaderNodePath === 'string') process.env.OMX_LEADER_NODE_PATH = prevLeaderNodePath;
+      else delete process.env.OMX_LEADER_NODE_PATH;
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevOstype === 'string') process.env.OSTYPE = prevOstype;
+      else delete process.env.OSTYPE;
+      if (typeof prevWsl === 'string') process.env.WSL_DISTRO_NAME = prevWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof prevWslInterop === 'string') process.env.WSL_INTEROP = prevWslInterop;
+      else delete process.env.WSL_INTEROP;
+      await rm(fakeRoot, { recursive: true, force: true });
+    }
+  });
+
   it('falls back to bash when SHELL is unsupported and zsh candidates are unavailable', () => {
     const prevShell = process.env.SHELL;
     const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
@@ -1037,7 +2229,7 @@ describe('buildWorkerStartupCommand', () => {
         buildWorkerStartupCommand('alpha', 1, [], process.cwd()),
       );
       assert.match(cmd, /\/bin\/bash\b/, 'must fall back to bash when zsh is unavailable');
-      assert.match(cmd, /\.bashrc/, 'must source bash rc file for bash fallback');
+      assert.doesNotMatch(cmd, /\.bashrc/, 'must not source bash rc file for bash fallback by default');
       assert.doesNotMatch(cmd, /fish/, 'must not launch unsupported fish shell');
     } finally {
       if (typeof prevShell === 'string') process.env.SHELL = prevShell;
@@ -1056,7 +2248,8 @@ describe('buildWorkerStartupCommand', () => {
       const cmd = withMockedExistsSync((candidate) => candidate === '/opt/custom/fish', () =>
         buildWorkerStartupCommand('alpha', 1, [], process.cwd()),
       );
-      assert.match(cmd, /'\/bin\/sh' -lc\b/, 'must launch workers through /bin/sh when no supported shells exist');
+      assert.match(cmd, /'\/bin\/sh' -c\b/, 'must launch workers through /bin/sh when no supported shells exist');
+      assert.doesNotMatch(cmd, /'\/bin\/sh' -lc\b/);
       assert.doesNotMatch(cmd, /\.zshrc|\.bashrc/, 'must not source zsh/bash rc files for /bin/sh fallback');
     } finally {
       if (typeof prevShell === 'string') process.env.SHELL = prevShell;
@@ -1097,6 +2290,13 @@ describe('team worker CLI helpers', () => {
     );
   });
 
+  it('translateWorkerLaunchArgsForCli keeps read-only claude roles out of skip-permissions mode', () => {
+    assert.deepEqual(
+      translateWorkerLaunchArgsForCli('claude', ['--model', 'claude-3-7-sonnet'], undefined, 'architect'),
+      [],
+    );
+  });
+
   it('translateWorkerLaunchArgsForCli emits gemini approval-mode by default and adds -i when initial prompt is provided', () => {
     assert.deepEqual(
       translateWorkerLaunchArgsForCli('gemini', ['--model', 'gemini-2.0-pro', '--json']),
@@ -1120,6 +2320,13 @@ describe('team worker CLI helpers', () => {
     assert.deepEqual(
       translateWorkerLaunchArgsForCli('gemini', ['--model', 'gpt-5.3-codex-spark'], 'Read worker inbox'),
       ['--approval-mode', 'yolo', '-i', 'Read worker inbox'],
+    );
+  });
+
+  it('translateWorkerLaunchArgsForCli keeps planning/read-only gemini roles out of yolo mode', () => {
+    assert.deepEqual(
+      translateWorkerLaunchArgsForCli('gemini', ['--model', 'gemini-2.0-pro'], 'Read worker inbox', 'planner'),
+      ['-i', 'Read worker inbox', '--model', 'gemini-2.0-pro'],
     );
   });
 
@@ -1252,6 +2459,55 @@ describe('team worker launch mode helpers', () => {
       assert.deepEqual(spec.args, ['--model', 'gpt-5.3-codex', '--dangerously-bypass-approvals-and-sandbox']);
       assert.equal(spec.env.OMX_TEAM_WORKER, 'alpha-team/worker-2');
       assert.equal(spec.env.OMX_TEAM_STATE_ROOT, '/tmp/workspace/.omx/state');
+      assert.equal(spec.env.OMX_TMUX_HUD_OWNER, undefined);
+      assert.equal(spec.env.OMX_TMUX_HUD_LEADER_PANE, undefined);
+    } finally {
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
+  it('buildWorkerProcessLaunchSpec scrubs HUD ownership env from worker launches', () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    try {
+      const spec = buildWorkerProcessLaunchSpec(
+        'alpha-team',
+        1,
+        [],
+        '/tmp/workspace',
+        {
+          OMX_TEAM_STATE_ROOT: '/tmp/workspace/.omx/state',
+          OMX_TMUX_HUD_OWNER: '1',
+          OMX_TMUX_HUD_LEADER_PANE: '%leader',
+        },
+        'codex',
+      );
+      assert.equal(spec.env.OMX_TEAM_WORKER, 'alpha-team/worker-1');
+      assert.equal(spec.env.OMX_TEAM_STATE_ROOT, '/tmp/workspace/.omx/state');
+      assert.equal(spec.env.OMX_TMUX_HUD_OWNER, undefined);
+      assert.equal(spec.env.OMX_TMUX_HUD_LEADER_PANE, undefined);
+    } finally {
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
+  it('buildWorkerProcessLaunchSpec does not force codex bypass for read-only roles', () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    try {
+      const spec = buildWorkerProcessLaunchSpec(
+        'alpha-team',
+        2,
+        ['--model', 'gpt-5.3-codex-spark'],
+        '/tmp/workspace',
+        { OMX_TEAM_STATE_ROOT: '/tmp/workspace/.omx/state' },
+        'codex',
+        undefined,
+        'explore',
+      );
+      assert.deepEqual(spec.args, ['--model', 'gpt-5.3-codex-spark']);
     } finally {
       if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
       else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
@@ -1283,6 +2539,478 @@ describe('team worker launch mode helpers', () => {
     } finally {
       if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
       else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
+  it('buildWorkerProcessLaunchSpec wraps Windows PowerShell shims for prompt workers', async () => {
+    const fakeBin = await mkdtemp(join(tmpdir(), 'omx-worker-spec-win32-'));
+    const prevPath = process.env.PATH;
+    const prevPathext = process.env.PATHEXT;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevMsystem = process.env.MSYSTEM;
+    const prevOstype = process.env.OSTYPE;
+    const prevWsl = process.env.WSL_DISTRO_NAME;
+    const prevWslInterop = process.env.WSL_INTEROP;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    process.env.PATH = fakeBin;
+    process.env.PATHEXT = '.PS1';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    delete process.env.MSYSTEM;
+    delete process.env.OSTYPE;
+    delete process.env.WSL_DISTRO_NAME;
+    delete process.env.WSL_INTEROP;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      const codexPs1Path = join(fakeBin, 'codex.ps1');
+      await writeFile(codexPs1Path, '');
+
+      const spec = buildWorkerProcessLaunchSpec(
+        'beta-team',
+        1,
+        ['--model', 'gpt-5'],
+        'C:\\workspace',
+        {},
+        'codex',
+      );
+
+      assert.match(spec.command, /powershell(?:\.exe)?$/i);
+      assert.deepEqual(spec.args.slice(0, 5), ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File']);
+      assert.equal(spec.args[5], codexPs1Path);
+      assert.deepEqual(spec.args.slice(6), ['--model', 'gpt-5', '--dangerously-bypass-approvals-and-sandbox']);
+      assert.equal(spec.env.OMX_LEADER_CLI_PATH, codexPs1Path);
+      assert.notEqual(spec.command, codexPs1Path);
+    } finally {
+      if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+      if (typeof prevPath === 'string') process.env.PATH = prevPath;
+      else delete process.env.PATH;
+      if (typeof prevPathext === 'string') process.env.PATHEXT = prevPathext;
+      else delete process.env.PATHEXT;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevOstype === 'string') process.env.OSTYPE = prevOstype;
+      else delete process.env.OSTYPE;
+      if (typeof prevWsl === 'string') process.env.WSL_DISTRO_NAME = prevWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof prevWslInterop === 'string') process.env.WSL_INTEROP = prevWslInterop;
+      else delete process.env.WSL_INTEROP;
+      await rm(fakeBin, { recursive: true, force: true });
+    }
+  });
+
+  it('buildWorkerProcessLaunchSpec records the resolved node-hosted Codex launcher on native Windows', async () => {
+    const fakeRoot = await mkdtemp(join(tmpdir(), 'omx-worker-spec-win32-node-hosted-'));
+    const fakeBin = join(fakeRoot, 'node_modules', '.bin');
+    const prevPath = process.env.PATH;
+    const prevPathext = process.env.PATHEXT;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevMsystem = process.env.MSYSTEM;
+    const prevOstype = process.env.OSTYPE;
+    const prevWsl = process.env.WSL_DISTRO_NAME;
+    const prevWslInterop = process.env.WSL_INTEROP;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    process.env.PATH = fakeBin;
+    process.env.PATHEXT = '.CMD;.PS1';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    delete process.env.MSYSTEM;
+    delete process.env.OSTYPE;
+    delete process.env.WSL_DISTRO_NAME;
+    delete process.env.WSL_INTEROP;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      const codexCmdPath = join(fakeBin, 'codex.cmd');
+      const codexJsPath = join(fakeRoot, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+      await mkdir(fakeBin, { recursive: true });
+      await mkdir(join(fakeRoot, 'node_modules', '@openai', 'codex', 'bin'), { recursive: true });
+      await writeFile(codexCmdPath, '@echo off\r\n');
+      await writeFile(codexJsPath, '');
+
+      const spec = buildWorkerProcessLaunchSpec(
+        'beta-team',
+        1,
+        ['--model', 'gpt-5'],
+        'C:\\workspace',
+        {},
+        'codex',
+      );
+
+      assert.equal(spec.command, process.execPath);
+      assert.deepEqual(spec.args, [codexJsPath, '--model', 'gpt-5', '--dangerously-bypass-approvals-and-sandbox']);
+      assert.equal(spec.env.OMX_LEADER_CLI_PATH, codexJsPath);
+      assert.notEqual(spec.env.OMX_LEADER_CLI_PATH, codexCmdPath);
+    } finally {
+      if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+      if (typeof prevPath === 'string') process.env.PATH = prevPath;
+      else delete process.env.PATH;
+      if (typeof prevPathext === 'string') process.env.PATHEXT = prevPathext;
+      else delete process.env.PATHEXT;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevOstype === 'string') process.env.OSTYPE = prevOstype;
+      else delete process.env.OSTYPE;
+      if (typeof prevWsl === 'string') process.env.WSL_DISTRO_NAME = prevWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof prevWslInterop === 'string') process.env.WSL_INTEROP = prevWslInterop;
+      else delete process.env.WSL_INTEROP;
+      await rm(fakeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('buildWorkerProcessLaunchSpec preserves ambient CODEX_HOME so Codex workers keep provider websocket metadata', async () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const prevSqliteHome = process.env.CODEX_SQLITE_HOME;
+    const prevProviderEnv = process.env.CUSTOM_PROVIDER_API_KEY;
+    const codexHome = await mkdtemp(join(tmpdir(), 'omx-team-provider-websocket-'));
+    const sqliteHome = await mkdtemp(join(tmpdir(), 'omx-team-provider-sqlite-'));
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.CODEX_HOME = codexHome;
+    process.env.CODEX_SQLITE_HOME = sqliteHome;
+    process.env.CUSTOM_PROVIDER_API_KEY = 'test-secret';
+
+    try {
+      await writeFile(join(codexHome, 'config.toml'), [
+        'model = "gpt-5.5"',
+        'model_provider = "custom_provider"',
+        '',
+        '[model_providers.custom_provider]',
+        'name = "custom_provider"',
+        'base_url = "http://localhost:3000/v1"',
+        'wire_api = "responses"',
+        'supports_websockets = true',
+        'requires_openai_auth = true',
+        'env_key = "CUSTOM_PROVIDER_API_KEY"',
+        '',
+      ].join('\n'));
+
+      const spec = buildWorkerProcessLaunchSpec(
+        'websocket-team',
+        1,
+        [],
+        '/tmp/workspace',
+        {},
+        'codex',
+      );
+
+      assert.equal(spec.env.CODEX_HOME, codexHome);
+      assert.equal(spec.env.CODEX_SQLITE_HOME, sqliteHome);
+      assert.equal(spec.env.CUSTOM_PROVIDER_API_KEY, 'test-secret');
+    } finally {
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevCodexHome === 'string') process.env.CODEX_HOME = prevCodexHome;
+      else delete process.env.CODEX_HOME;
+      if (typeof prevSqliteHome === 'string') process.env.CODEX_SQLITE_HOME = prevSqliteHome;
+      else delete process.env.CODEX_SQLITE_HOME;
+      if (typeof prevProviderEnv === 'string') process.env.CUSTOM_PROVIDER_API_KEY = prevProviderEnv;
+      else delete process.env.CUSTOM_PROVIDER_API_KEY;
+      await rm(codexHome, { recursive: true, force: true });
+      await rm(sqliteHome, { recursive: true, force: true });
+    }
+  });
+
+  it('buildWorkerProcessLaunchSpec injects the active provider env_key from CODEX_HOME config.toml', async () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const prevProviderEnv = process.env.CUSTOM_PROVIDER_API_KEY;
+    const codexHome = await mkdtemp(join(tmpdir(), 'omx-team-provider-env-'));
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.CODEX_HOME = codexHome;
+    process.env.CUSTOM_PROVIDER_API_KEY = 'test-secret';
+
+    try {
+      await writeFile(join(codexHome, 'config.toml'), [
+        'model_provider = "custom_provider"',
+        '',
+        '[model_providers.custom_provider]',
+        'name = "custom_provider"',
+        'base_url = "http://localhost:3000/v1"',
+        'wire_api = "responses"',
+        'requires_openai_auth = true',
+        'env_key = "CUSTOM_PROVIDER_API_KEY"',
+        '',
+      ].join('\n'));
+
+      const spec = buildWorkerProcessLaunchSpec(
+        'gamma-team',
+        1,
+        [],
+        '/tmp/workspace',
+        {},
+        'codex',
+      );
+
+      assert.equal(spec.env.CUSTOM_PROVIDER_API_KEY, 'test-secret');
+    } finally {
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevCodexHome === 'string') process.env.CODEX_HOME = prevCodexHome;
+      else delete process.env.CODEX_HOME;
+      if (typeof prevProviderEnv === 'string') process.env.CUSTOM_PROVIDER_API_KEY = prevProviderEnv;
+      else delete process.env.CUSTOM_PROVIDER_API_KEY;
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('buildWorkerProcessLaunchSpec uses CLI model_provider override for Codex provider env injection', async () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const prevDefaultProviderEnv = process.env.DEFAULT_PROVIDER_API_KEY;
+    const prevCheapProviderEnv = process.env.CHEAP_PROVIDER_API_KEY;
+    const codexHome = await mkdtemp(join(tmpdir(), 'omx-team-provider-cli-override-'));
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.CODEX_HOME = codexHome;
+    process.env.DEFAULT_PROVIDER_API_KEY = 'default-secret';
+    process.env.CHEAP_PROVIDER_API_KEY = 'cheap-secret';
+
+    try {
+      await writeFile(join(codexHome, 'config.toml'), [
+        'model_provider = "default_provider"',
+        '',
+        '[model_providers.default_provider]',
+        'name = "default_provider"',
+        'base_url = "http://localhost:3000/v1"',
+        'wire_api = "responses"',
+        'requires_openai_auth = true',
+        'env_key = "DEFAULT_PROVIDER_API_KEY"',
+        '',
+        '[model_providers.cheapRouter]',
+        'name = "cheapRouter"',
+        'base_url = "http://localhost:4000/v1"',
+        'wire_api = "responses"',
+        'requires_openai_auth = true',
+        'env_key = "CHEAP_PROVIDER_API_KEY"',
+        '',
+      ].join('\n'));
+
+      const spec = buildWorkerProcessLaunchSpec(
+        'provider-override-team',
+        1,
+        ['-c', 'model_provider="cheapRouter"', '--model', 'gpt-5.5'],
+        '/tmp/workspace',
+        {},
+        'codex',
+      );
+
+      assert.equal(spec.env.CHEAP_PROVIDER_API_KEY, 'cheap-secret');
+      assert.equal(spec.env.DEFAULT_PROVIDER_API_KEY, undefined);
+      assert.deepEqual(spec.args.slice(0, 4), ['-c', 'model_provider="cheapRouter"', '--model', 'gpt-5.5']);
+    } finally {
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevCodexHome === 'string') process.env.CODEX_HOME = prevCodexHome;
+      else delete process.env.CODEX_HOME;
+      if (typeof prevDefaultProviderEnv === 'string') process.env.DEFAULT_PROVIDER_API_KEY = prevDefaultProviderEnv;
+      else delete process.env.DEFAULT_PROVIDER_API_KEY;
+      if (typeof prevCheapProviderEnv === 'string') process.env.CHEAP_PROVIDER_API_KEY = prevCheapProviderEnv;
+      else delete process.env.CHEAP_PROVIDER_API_KEY;
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('buildWorkerProcessLaunchSpec does not inject the active provider env_key for non-codex workers', async () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const prevProviderEnv = process.env.CUSTOM_PROVIDER_API_KEY;
+    const codexHome = await mkdtemp(join(tmpdir(), 'omx-team-provider-env-'));
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.CODEX_HOME = codexHome;
+    process.env.CUSTOM_PROVIDER_API_KEY = 'test-secret';
+
+    try {
+      await writeFile(join(codexHome, 'config.toml'), [
+        'model_provider = "custom_provider"',
+        '',
+        '[model_providers.custom_provider]',
+        'name = "custom_provider"',
+        'base_url = "http://localhost:3000/v1"',
+        'wire_api = "responses"',
+        'requires_openai_auth = true',
+        'env_key = "CUSTOM_PROVIDER_API_KEY"',
+        '',
+      ].join('\n'));
+
+      const spec = buildWorkerProcessLaunchSpec(
+        'delta-team',
+        1,
+        [],
+        '/tmp/workspace',
+        {},
+        'claude',
+      );
+
+      assert.equal(spec.workerCli, 'claude');
+      assert.equal(spec.env.CODEX_HOME, undefined);
+      assert.equal(spec.env.CUSTOM_PROVIDER_API_KEY, undefined);
+    } finally {
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevCodexHome === 'string') process.env.CODEX_HOME = prevCodexHome;
+      else delete process.env.CODEX_HOME;
+      if (typeof prevProviderEnv === 'string') process.env.CUSTOM_PROVIDER_API_KEY = prevProviderEnv;
+      else delete process.env.CUSTOM_PROVIDER_API_KEY;
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('buildWorkerProcessLaunchSpec reads provider env from worker CODEX_HOME override', async () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const prevPrimaryProviderEnv = process.env.PRIMARY_PROVIDER_API_KEY;
+    const prevWorkerProviderEnv = process.env.WORKER_PROVIDER_API_KEY;
+    const leaderCodexHome = await mkdtemp(join(tmpdir(), 'omx-team-provider-env-leader-'));
+    const workerCodexHome = await mkdtemp(join(tmpdir(), 'omx-team-provider-env-worker-'));
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.CODEX_HOME = leaderCodexHome;
+    process.env.PRIMARY_PROVIDER_API_KEY = 'leader-secret';
+    process.env.WORKER_PROVIDER_API_KEY = 'worker-secret';
+
+    try {
+      await writeFile(join(leaderCodexHome, 'config.toml'), [
+        'model_provider = "primary_provider"',
+        '',
+        '[model_providers.primary_provider]',
+        'name = "primary_provider"',
+        'base_url = "http://localhost:3000/v1"',
+        'wire_api = "responses"',
+        'requires_openai_auth = true',
+        'env_key = "PRIMARY_PROVIDER_API_KEY"',
+        '',
+      ].join('\n'));
+
+      await writeFile(join(workerCodexHome, 'config.toml'), [
+        'model_provider = "worker_provider"',
+        '',
+        '[model_providers.worker_provider]',
+        'name = "worker_provider"',
+        'base_url = "http://localhost:4000/v1"',
+        'wire_api = "responses"',
+        'requires_openai_auth = true',
+        'env_key = "WORKER_PROVIDER_API_KEY"',
+        '',
+      ].join('\n'));
+
+      const spec = buildWorkerProcessLaunchSpec(
+        'epsilon-team',
+        1,
+        [],
+        '/tmp/workspace',
+        { CODEX_HOME: workerCodexHome },
+        'codex',
+      );
+
+      assert.equal(spec.env.CODEX_HOME, workerCodexHome);
+      assert.equal(spec.env.WORKER_PROVIDER_API_KEY, 'worker-secret');
+      assert.equal(spec.env.PRIMARY_PROVIDER_API_KEY, undefined);
+    } finally {
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevCodexHome === 'string') process.env.CODEX_HOME = prevCodexHome;
+      else delete process.env.CODEX_HOME;
+      if (typeof prevPrimaryProviderEnv === 'string') process.env.PRIMARY_PROVIDER_API_KEY = prevPrimaryProviderEnv;
+      else delete process.env.PRIMARY_PROVIDER_API_KEY;
+      if (typeof prevWorkerProviderEnv === 'string') process.env.WORKER_PROVIDER_API_KEY = prevWorkerProviderEnv;
+      else delete process.env.WORKER_PROVIDER_API_KEY;
+      await rm(leaderCodexHome, { recursive: true, force: true });
+      await rm(workerCodexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('buildWorkerProcessLaunchSpec keeps the worker env contract unchanged for ambient proxy vars', () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevHttpsProxy = process.env.HTTPS_PROXY;
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.HTTPS_PROXY = 'https://ambient-proxy.example:443';
+    try {
+      const spec = buildWorkerProcessLaunchSpec(
+        'eta-team',
+        1,
+        [],
+        '/tmp/workspace',
+        {},
+        'codex',
+      );
+      assert.equal(spec.env.HTTPS_PROXY, undefined);
+    } finally {
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevHttpsProxy === 'string') process.env.HTTPS_PROXY = prevHttpsProxy;
+      else delete process.env.HTTPS_PROXY;
+    }
+  });
+
+  it('buildWorkerProcessLaunchSpec resolves relative worker CODEX_HOME against the worker cwd', async () => {
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const prevLeaderProviderEnv = process.env.LEADER_PROVIDER_API_KEY;
+    const prevWorkerProviderEnv = process.env.WORKER_PROVIDER_API_KEY;
+    const originalCwd = process.cwd();
+    const leaderCwd = await mkdtemp(join(tmpdir(), 'omx-team-provider-relative-leader-'));
+    const workerCwd = await mkdtemp(join(tmpdir(), 'omx-team-provider-relative-worker-'));
+    const leaderCodexHome = join(leaderCwd, '.codex');
+    const workerCodexHome = join(workerCwd, '.codex');
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    process.env.CODEX_HOME = leaderCodexHome;
+    process.env.LEADER_PROVIDER_API_KEY = 'leader-secret';
+    process.env.WORKER_PROVIDER_API_KEY = 'worker-secret';
+
+    try {
+      await mkdir(leaderCodexHome, { recursive: true });
+      await mkdir(workerCodexHome, { recursive: true });
+
+      await writeFile(join(leaderCodexHome, 'config.toml'), [
+        'model_provider = "leader_provider"',
+        '',
+        '[model_providers.leader_provider]',
+        'name = "leader_provider"',
+        'base_url = "http://localhost:3000/v1"',
+        'wire_api = "responses"',
+        'requires_openai_auth = true',
+        'env_key = "LEADER_PROVIDER_API_KEY"',
+        '',
+      ].join('\n'));
+
+      await writeFile(join(workerCodexHome, 'config.toml'), [
+        'model_provider = "worker_provider"',
+        '',
+        '[model_providers.worker_provider]',
+        'name = "worker_provider"',
+        'base_url = "http://localhost:4000/v1"',
+        'wire_api = "responses"',
+        'requires_openai_auth = true',
+        'env_key = "WORKER_PROVIDER_API_KEY"',
+        '',
+      ].join('\n'));
+
+      process.chdir(leaderCwd);
+
+      const spec = buildWorkerProcessLaunchSpec(
+        'zeta-team',
+        1,
+        [],
+        workerCwd,
+        { CODEX_HOME: '.codex' },
+        'codex',
+      );
+
+      assert.equal(spec.env.CODEX_HOME, '.codex');
+      assert.equal(spec.env.WORKER_PROVIDER_API_KEY, 'worker-secret');
+      assert.equal(spec.env.LEADER_PROVIDER_API_KEY, undefined);
+    } finally {
+      process.chdir(originalCwd);
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevCodexHome === 'string') process.env.CODEX_HOME = prevCodexHome;
+      else delete process.env.CODEX_HOME;
+      if (typeof prevLeaderProviderEnv === 'string') process.env.LEADER_PROVIDER_API_KEY = prevLeaderProviderEnv;
+      else delete process.env.LEADER_PROVIDER_API_KEY;
+      if (typeof prevWorkerProviderEnv === 'string') process.env.WORKER_PROVIDER_API_KEY = prevWorkerProviderEnv;
+      else delete process.env.WORKER_PROVIDER_API_KEY;
+      await rm(leaderCwd, { recursive: true, force: true });
+      await rm(workerCwd, { recursive: true, force: true });
     }
   });
 });
@@ -1367,7 +3095,7 @@ case "$1" in
 ╭────────────────────────────────────────────╮
 │ >_ OpenAI Codex (v0.114.0)                 │
 │                                            │
-│ model:     gpt-5.4 high   /model to change │
+│ model:     gpt-5.5 high   /model to change │
 │ directory: ~/Workspace/demo                │
 ╰────────────────────────────────────────────╯
 
@@ -1382,6 +3110,66 @@ esac
 `,
       async () => {
         assert.equal(waitForWorkerReady('omx-team-x', 1, 1_000), true);
+      },
+    );
+  });
+
+  it('waitForWorkerReady falls back to recent scrollback when a live Codex viewport pushes the prompt below the visible slice', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-worker-ready-scrollback-fallback-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    if printf '%s\n' "$*" | grep -q -- ' -S -80'; then
+      cat <<'EOF'
+${VIEWPORT_SCROLLBACK_READY_CAPTURE}
+EOF
+    else
+      cat <<'EOF'
+${VIEWPORT_WITHOUT_VISIBLE_PROMPT_CAPTURE}
+EOF
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      async ({ logPath }) => {
+        assert.equal(waitForWorkerReady('omx-team-x', 1, 1_000), true);
+        const log = await readFile(logPath, 'utf-8');
+        assert.match(log, /capture-pane -t omx-team-x:1 -p/);
+        assert.match(log, /capture-pane -t omx-team-x:1 -p -S -80/);
+      },
+    );
+  });
+
+  it('waitForWorkerReady does not consult scrollback when the visible slice is only status text', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-worker-ready-no-scrollback-status-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    cat <<'EOF'
+gpt-5 50% left
+EOF
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      async ({ logPath }) => {
+        assert.equal(waitForWorkerReady('omx-team-x', 1, 250), false);
+        const log = await readFile(logPath, 'utf-8');
+        assert.match(log, /capture-pane -t omx-team-x:1 -p/);
+        assert.doesNotMatch(log, /capture-pane -t omx-team-x:1 -p -S -80/);
       },
     );
   });
@@ -1419,7 +3207,7 @@ EOF
 esac
 `,
       async ({ logPath }) => {
-        assert.equal(waitForWorkerReady('omx-team-x', 1, 1_000), true);
+        assert.equal(waitForWorkerReady('omx-team-x', 1, 5_000), true);
         const log = await readFile(logPath, 'utf-8');
         assert.match(log, /send-keys -t omx-team-x:1 -l -- 2/);
         assert.match(log, /send-keys -t omx-team-x:1 C-m/);
@@ -1464,6 +3252,1706 @@ esac
     withEmptyPath(() => {
       assert.equal(waitForWorkerReady('omx-team-x', 1, 1), false);
     });
+  });
+});
+
+
+describe('waitForWorkerReadyAsync parity', () => {
+  it('uses visible capture-pane argv without tail flags', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-worker-ready-async-visible-capture-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      async ({ logPath }) => {
+        assert.equal(await waitForWorkerReadyAsync('omx-team-x', 1, 1_000), true);
+        const log = await readFile(logPath, 'utf-8');
+        assert.match(log, /capture-pane -t omx-team-x:1 -p/);
+        assert.doesNotMatch(log, /capture-pane -t omx-team-x:1 -p -S/);
+      },
+    );
+  });
+
+  it('falls back to recent scrollback only when visible slice shows a live Codex viewport', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-worker-ready-async-scrollback-fallback-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    if printf '%s\n' "$*" | grep -q -- ' -S -80'; then
+      cat <<'EOF'
+${VIEWPORT_SCROLLBACK_READY_CAPTURE}
+EOF
+    else
+      cat <<'EOF'
+${VIEWPORT_WITHOUT_VISIBLE_PROMPT_CAPTURE}
+EOF
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      async ({ logPath }) => {
+        assert.equal(await waitForWorkerReadyAsync('omx-team-x', 1, 1_000), true);
+        const log = await readFile(logPath, 'utf-8');
+        assert.match(log, /capture-pane -t omx-team-x:1 -p/);
+        assert.match(log, /capture-pane -t omx-team-x:1 -p -S -80/);
+      },
+    );
+
+    await withMockTmuxFixture(
+      'omx-tmux-worker-ready-async-no-scrollback-status-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    printf 'gpt-5 50%% left\n'
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      async ({ logPath }) => {
+        assert.equal(await waitForWorkerReadyAsync('omx-team-x', 1, 250), false);
+        const log = await readFile(logPath, 'utf-8');
+        assert.match(log, /capture-pane -t omx-team-x:1 -p/);
+        assert.doesNotMatch(log, /capture-pane -t omx-team-x:1 -p -S -80/);
+      },
+    );
+  });
+
+  it('auto-accepts trust prompts and then observes readiness', async () => {
+    const previousAutoTrust = process.env.OMX_TEAM_AUTO_TRUST;
+    delete process.env.OMX_TEAM_AUTO_TRUST;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-worker-ready-async-trust-',
+        (logPath) => `#!/bin/sh
+set -eu
+state_dir="$(dirname "${logPath}")"
+accepted_file="$state_dir/accepted"
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    if [ -f "$accepted_file" ]; then
+      cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    else
+      cat <<'EOF'
+Do you trust the contents of this directory?
+Press enter to continue
+EOF
+    fi
+    exit 0
+    ;;
+  send-keys)
+    if [ "\${4:-}" = "C-m" ]; then
+      : > "$accepted_file"
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          assert.equal(await waitForWorkerReadyAsync('omx-team-x', 1, 5_000), true);
+          const log = await readFile(logPath, 'utf-8');
+          assert.match(log, /send-keys -t omx-team-x:1 C-m/);
+        },
+      );
+    } finally {
+      if (typeof previousAutoTrust === 'string') process.env.OMX_TEAM_AUTO_TRUST = previousAutoTrust;
+      else delete process.env.OMX_TEAM_AUTO_TRUST;
+    }
+  });
+
+  it('auto-accepts the Claude bypass prompt and then observes readiness', async () => {
+    const previousAutoAccept = process.env.OMX_TEAM_AUTO_ACCEPT_BYPASS;
+    delete process.env.OMX_TEAM_AUTO_ACCEPT_BYPASS;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-worker-ready-async-claude-bypass-',
+      (logPath) => `#!/bin/sh
+set -eu
+state_dir="$(dirname "${logPath}")"
+accepted_file="$state_dir/accepted"
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    if [ -f "$accepted_file" ]; then
+      cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    else
+      cat <<'EOF'
+${CLAUDE_BYPASS_PROMPT_CAPTURE}
+EOF
+    fi
+    exit 0
+    ;;
+  send-keys)
+    if [ "\${4:-}" = "-l" ] && [ "\${6:-}" = "2" ]; then
+      : > "$accepted_file"
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          assert.equal(await waitForWorkerReadyAsync('omx-team-x', 1, 5_000), true);
+          const log = await readFile(logPath, 'utf-8');
+          assert.match(log, /send-keys -t omx-team-x:1 -l -- 2/);
+        },
+      );
+    } finally {
+      if (typeof previousAutoAccept === 'string') process.env.OMX_TEAM_AUTO_ACCEPT_BYPASS = previousAutoAccept;
+      else delete process.env.OMX_TEAM_AUTO_ACCEPT_BYPASS;
+    }
+  });
+
+  it('returns false on timeout or tmux command failure', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-worker-ready-async-capture-failure-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    exit 1
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      async () => {
+        assert.equal(await waitForWorkerReadyAsync('omx-team-x', 1, 1), false);
+      },
+    );
+
+    await withEmptyPath(async () => {
+      assert.equal(await waitForWorkerReadyAsync('omx-team-x', 1, 1), false);
+    });
+  });
+});
+
+describe('createTeamSession tmux instance tagging', () => {
+  it('redraws the leader pane after team layout changes so wrapped diff hunks repaint with gutters', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-redraw-leader-'));
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-redraw-leader-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*)
+        echo "120"
+        ;;
+      *)
+        echo "leader:0 %1"
+        ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n"
+        ;;
+      *)
+        printf "%%1\\n"
+        ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*)
+        echo "%2"
+        ;;
+      *)
+        echo "%3"
+        ;;
+    esac
+    exit 0
+    ;;
+  set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|send-keys)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+        `,
+        async ({ logPath }) => {
+          const fakeBinDir = join(logPath, '..');
+          const geminiPath = join(fakeBinDir, 'gemini');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+
+          process.env.TMUX = 'leader-session,stub,0';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+
+          createTeamSession('Diff Gutter Redraw', 1, cwd);
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /select-layout -t leader:0 main-vertical/);
+          assert.match(tmuxLog, /set-window-option -t leader:0 main-pane-width 60/);
+          assert.match(tmuxLog, /split-window -v -f -l 3 -t leader:0 -d -P -F #\{pane_id\}/);
+          assert.match(
+            tmuxLog,
+            /send-keys -t %1 C-l/,
+            'leader Codex pane must repaint after team splits/resizes so tmux does not auto-wrap diff continuation rows without the line-number gutter',
+          );
+        },
+      );
+    } finally {
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('tags leader, worker, and HUD panes with pane-scoped instance ownership', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-pane-tags-'));
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevSessionId = process.env.OMX_SESSION_ID;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-pane-tags-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*)
+        echo "120"
+        ;;
+      *)
+        echo "shared:0 %1"
+        ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n"
+        ;;
+      *)
+        printf "%%1\\n"
+        ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*)
+        echo "%2"
+        ;;
+      *)
+        echo "%3"
+        ;;
+    esac
+    exit 0
+    ;;
+  set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+        `,
+        async ({ logPath }) => {
+          const fakeBinDir = join(logPath, '..');
+          const geminiPath = join(fakeBinDir, 'gemini');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+
+          process.env.TMUX = '1';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_SESSION_ID = 'omx-pane-scope';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+
+          const session = createTeamSession('Pane Tags', 1, cwd);
+          assert.equal(session.name, 'shared:0');
+          assert.equal(session.leaderPaneId, '%1');
+          assert.deepEqual(session.workerPaneIds, ['%2']);
+          assert.equal(session.hudPaneId, '%3');
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /set-option -t shared @omx_instance_id omx-pane-scope/);
+          assert.match(tmuxLog, /set-option -p -t %1 @omx_pane_instance_id omx-pane-scope/);
+          assert.match(tmuxLog, /set-option -p -t %2 @omx_pane_instance_id omx-pane-scope/);
+          assert.match(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id omx-pane-scope/);
+          assert.match(tmuxLog, /set-option -p -t %1 @omx_team_pane_owner_id team:pane-tags/);
+          assert.match(tmuxLog, /set-option -p -t %2 @omx_team_pane_owner_id team:pane-tags/);
+          assert.match(tmuxLog, /set-option -p -t %3 @omx_team_pane_owner_id team:pane-tags/);
+          assert.match(tmuxLog, /exec env OMX_SESSION_ID='omx-pane-scope' OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' .*hud --watch/);
+        },
+      );
+    } finally {
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevSessionId === 'string') process.env.OMX_SESSION_ID = prevSessionId;
+      else delete process.env.OMX_SESSION_ID;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not reuse the Team pane owner token as the HUD logical session id', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-hud-session-boundary-'));
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevSessionId = process.env.OMX_SESSION_ID;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-hud-session-boundary-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*)
+        echo "120"
+        ;;
+      *)
+        echo "shared:0 %1"
+        ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"-t %2 -F #{pane_pid}"*)
+        echo "2000002222"
+        ;;
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n"
+        ;;
+      *)
+        printf "%%1\\n"
+        ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*)
+        echo "%2"
+        ;;
+      *)
+        echo "%3"
+        ;;
+    esac
+    exit 0
+    ;;
+  set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+        `,
+        async ({ logPath }) => {
+          const fakeBinDir = join(logPath, '..');
+          const geminiPath = join(fakeBinDir, 'gemini');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+
+          process.env.TMUX = '1';
+          process.env.TMUX_PANE = '%1';
+          delete process.env.OMX_SESSION_ID;
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+
+          const session = createTeamSession('HUD Session Boundary', 1, cwd, [], undefined, {
+            teamPaneOwnerId: 'team:explicit-owner-boundary',
+          });
+          assert.equal(session.hudPaneId, '%3');
+          assert.equal(session.teamPaneOwnerId, 'team:explicit-owner-boundary');
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /set-option -p -t %1 @omx_team_pane_owner_id team:explicit-owner-boundary/);
+          assert.match(tmuxLog, /set-option -p -t %2 @omx_team_pane_owner_id team:explicit-owner-boundary/);
+          assert.match(tmuxLog, /set-option -p -t %3 @omx_team_pane_owner_id team:explicit-owner-boundary/);
+          assert.match(tmuxLog, /exec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' .*hud --watch/);
+          assert.doesNotMatch(tmuxLog, /OMX_SESSION_ID='team:explicit-owner-boundary'/);
+        },
+      );
+    } finally {
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevSessionId === 'string') process.env.OMX_SESSION_ID = prevSessionId;
+      else delete process.env.OMX_SESSION_ID;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('removes only HUD panes owned by the current leader during team startup', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-owned-hud-startup-'));
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevSessionId = process.env.OMX_SESSION_ID;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-owned-hud-startup-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*)
+        echo "120"
+        ;;
+      *)
+        echo "shared:0 %1"
+        ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n"
+        printf "%%7\\tnode\\t'codex neighbor'\\n"
+        printf "%%2\\tnode\\texec env OMX_SESSION_ID='leader-session-a' OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%1' node /tmp/bin/omx.js hud --watch\\n"
+        printf "%%8\\tnode\\texec env OMX_SESSION_ID='neighbor-session' OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%7' node /tmp/bin/omx.js hud --watch\\n"
+        ;;
+      *)
+        printf "%%1\\n%%7\\n%%2\\n%%8\\n"
+        ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*)
+        echo "%3"
+        ;;
+      *)
+        echo "%4"
+        ;;
+    esac
+    exit 0
+    ;;
+  set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|send-keys|kill-pane)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+        `,
+        async ({ logPath }) => {
+          const fakeBinDir = join(logPath, '..');
+          const geminiPath = join(fakeBinDir, 'gemini');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+
+          process.env.TMUX = 'shared-session,stub,0';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_SESSION_ID = 'leader-session-a';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+
+          const session = createTeamSession('Owned HUD Startup', 1, cwd);
+          assert.equal(session.leaderPaneId, '%1');
+          assert.equal(session.hudPaneId, '%4');
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /kill-pane -t %2/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %8/);
+          assert.match(tmuxLog, /split-window -v -f -l 3 -t shared:0 -d -P -F #\{pane_id\}/);
+        },
+      );
+    } finally {
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevSessionId === 'string') process.env.OMX_SESSION_ID = prevSessionId;
+      else delete process.env.OMX_SESSION_ID;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('uses tmux 3.2a-compatible client-resized hook registration for team HUD resize', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-resize-hook-fallback-'));
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevWarn = console.warn;
+    const warnings: string[] = [];
+
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-resize-hook-fallback-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V)
+    echo "tmux 3.2a"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*)
+        echo "120"
+        ;;
+      *)
+        echo "leader:0 %1"
+        ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*)
+        printf "%%1\tnode\t'codex'\n"
+        ;;
+      *)
+        printf "%%1\n"
+        ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*)
+        echo "%2"
+        ;;
+      *)
+        echo "%3"
+        ;;
+    esac
+    exit 0
+    ;;
+  set-hook)
+    case "$*" in
+      *"window-resized["*)
+        echo "invalid option: window-resized[]" >&2
+        exit 1
+        ;;
+      *" -w "*)
+        echo "invalid option: -w" >&2
+        exit 1
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
+    ;;
+  set-option|resize-pane|select-layout|set-window-option|select-pane|run-shell)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          const fakeBinDir = join(logPath, '..');
+          const geminiPath = join(fakeBinDir, 'gemini');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+
+          process.env.TMUX = 'leader-session,stub,0';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+          console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+
+          const session = createTeamSession('Resize Hook Fallback', 1, cwd);
+          assert.equal(session.hudPaneId, '%3');
+          assert.ok(session.resizeHookName);
+          assert.equal(session.resizeHookTarget, 'leader:0');
+          assert.equal(warnings.join('\n'), '');
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /set-hook -t leader:0 client-resized\[\d+\]/);
+          assert.doesNotMatch(tmuxLog, /window-resized\[/);
+          assert.doesNotMatch(tmuxLog, /set-hook -w /);
+          assert.match(tmuxLog, /set-hook -t leader:0 client-attached\[\d+\]/);
+          assert.match(tmuxLog, new RegExp(`run-shell -b sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; .*resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
+          assert.match(tmuxLog, new RegExp(`run-shell .*resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %3/);
+        },
+      );
+    } finally {
+      console.warn = prevWarn;
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('degrades HUD run-shell resize failures to warnings during team startup', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-runshell-fallback-'));
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevWarn = console.warn;
+    const warnings: string[] = [];
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-runshell-fallback-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *) echo "leader:0 %1" ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*) printf "%%1\\tnode\\t'codex'\\n" ;;
+      *) printf "%%1\\n" ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*) echo "%2" ;;
+      *) echo "%3" ;;
+    esac
+    exit 0
+    ;;
+  run-shell)
+    echo "Unsupported tmux compatibility command: run-shell" >&2
+    exit 1
+    ;;
+  set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|send-keys)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          const fakeBinDir = join(logPath, '..');
+          const geminiPath = join(fakeBinDir, 'gemini');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+
+          process.env.TMUX = 'leader-session,stub,0';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+          console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+
+          const session = createTeamSession('Run Shell Fallback', 1, cwd);
+          assert.equal(session.hudPaneId, '%3');
+          assert.match(warnings.join('\n'), /HUD resize/);
+          assert.match(warnings.join('\n'), /Unsupported tmux compatibility command: run-shell/);
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /run-shell -b sleep/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %3/);
+        },
+      );
+    } finally {
+      console.warn = prevWarn;
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('native Windows HUD reconciliation', () => {
+  it('allows team startup on native Windows when current tmux client is reachable without TMUX env vars', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-win32-no-env-'));
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevMsystem = process.env.MSYSTEM;
+    const prevOstype = process.env.OSTYPE;
+    const prevWsl = process.env.WSL_DISTRO_NAME;
+    const prevWslInterop = process.env.WSL_INTEROP;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-win32-no-env-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*)
+        echo "120"
+        ;;
+      *)
+        echo "leader:0 %1"
+        ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n%%2\\tgemini\\t'gemini'\\n%%3\\tnode\\t'node omx hud --watch'\\n"
+        ;;
+      *)
+        printf "%%1\\n%%2\\n%%3\\n"
+        ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*)
+        echo "%2"
+        ;;
+      *)
+        echo "%3"
+        ;;
+    esac
+    exit 0
+    ;;
+  resize-pane|select-layout|set-window-option|select-pane|kill-pane|set-hook|run-shell)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          const fakeBinDir = join(logPath, '..');
+          const geminiPath = join(fakeBinDir, 'gemini');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+
+          delete process.env.TMUX;
+          delete process.env.TMUX_PANE;
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+          delete process.env.MSYSTEM;
+          delete process.env.OSTYPE;
+          delete process.env.WSL_DISTRO_NAME;
+          delete process.env.WSL_INTEROP;
+          Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+          const session = createTeamSession('Windows Team', 1, cwd);
+          assert.equal(session.name, 'leader:0');
+          assert.equal(session.leaderPaneId, '%1');
+          assert.equal(session.hudPaneId, '%3');
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /display-message -p #\{session_name\}:#\{window_index\} #\{pane_id\}/);
+          assert.match(tmuxLog, /powershell\.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand/);
+          assert.doesNotMatch(tmuxLog, /\/bin\/sh -lc/);
+          assert.match(tmuxLog, new RegExp(`resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
+        },
+      );
+    } finally {
+      if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevOstype === 'string') process.env.OSTYPE = prevOstype;
+      else delete process.env.OSTYPE;
+      if (typeof prevWsl === 'string') process.env.WSL_DISTRO_NAME = prevWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof prevWslInterop === 'string') process.env.WSL_INTEROP = prevWslInterop;
+      else delete process.env.WSL_INTEROP;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('avoids nested tmux run-shell hooks during team HUD startup on native Windows', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-win32-hud-'));
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevMsystem = process.env.MSYSTEM;
+    const prevOstype = process.env.OSTYPE;
+    const prevWsl = process.env.WSL_DISTRO_NAME;
+    const prevWslInterop = process.env.WSL_INTEROP;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-win32-hud-reconcile-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*)
+        echo "120"
+        ;;
+      *)
+        echo "leader:0 %1"
+        ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n%%2\\tgemini\\t'gemini'\\n%%3\\tnode\\t'node omx hud --watch'\\n"
+        ;;
+      *)
+        printf "%%1\\n%%2\\n%%3\\n"
+        ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*)
+        echo "%2"
+        ;;
+      *)
+        echo "%3"
+        ;;
+    esac
+    exit 0
+    ;;
+  resize-pane|select-layout|set-window-option|select-pane|kill-pane)
+    exit 0
+    ;;
+  set-hook|run-shell)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          const fakeBinDir = join(logPath, '..');
+          const geminiPath = join(fakeBinDir, 'gemini');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+
+          process.env.TMUX = 'leader-session,stub,0';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+          delete process.env.MSYSTEM;
+          delete process.env.OSTYPE;
+          delete process.env.WSL_DISTRO_NAME;
+          delete process.env.WSL_INTEROP;
+          Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+          const session = createTeamSession('Windows Team', 1, cwd);
+          assert.equal(session.hudPaneId, '%3');
+          assert.equal(session.resizeHookName, null);
+          assert.equal(session.resizeHookTarget, null);
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, new RegExp(`resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
+          assert.doesNotMatch(tmuxLog, /set-hook -w /);
+          assert.doesNotMatch(tmuxLog, /window-resized\[/);
+          assert.doesNotMatch(tmuxLog, /set-hook -t leader:0 client-attached\[\d+\]/);
+          assert.doesNotMatch(tmuxLog, /run-shell -b sleep \d+; tmux resize-pane -t %3 -y \d+ >/);
+          assert.doesNotMatch(tmuxLog, /run-shell tmux resize-pane -t %3 -y \d+ >/);
+        },
+      );
+    } finally {
+      if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevOstype === 'string') process.env.OSTYPE = prevOstype;
+      else delete process.env.OSTYPE;
+      if (typeof prevWsl === 'string') process.env.WSL_DISTRO_NAME = prevWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof prevWslInterop === 'string') process.env.WSL_INTEROP = prevWslInterop;
+      else delete process.env.WSL_INTEROP;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects synthetic worker and HUD pane ids that never materialize on native Windows', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-win32-synthetic-pane-'));
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevMsystem = process.env.MSYSTEM;
+    const prevOstype = process.env.OSTYPE;
+    const prevWsl = process.env.WSL_DISTRO_NAME;
+    const prevWslInterop = process.env.WSL_INTEROP;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-win32-synthetic-pane-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V)
+    echo "tmux 3.3.2"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*)
+        echo "120"
+        ;;
+      *)
+        echo "leader:0 %1"
+        ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n"
+        ;;
+      *)
+        printf "%%1\\n"
+        ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*)
+        echo "%2"
+        ;;
+      *)
+        echo "%3"
+        ;;
+    esac
+    exit 0
+    ;;
+  kill-pane|select-layout|set-window-option|select-pane|resize-pane|set-hook|run-shell)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          const fakeBinDir = join(logPath, '..');
+          const geminiPath = join(fakeBinDir, 'gemini');
+          const powershellExePath = join(fakeBinDir, 'powershell.exe');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+          await writeFile(powershellExePath, '');
+
+          process.env.TMUX = 'leader-session,stub,0';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+          delete process.env.MSYSTEM;
+          delete process.env.OSTYPE;
+          delete process.env.WSL_DISTRO_NAME;
+          delete process.env.WSL_INTEROP;
+          Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+          assert.throws(
+            () => createTeamSession('Windows Team', 1, cwd),
+            /worker pane 1 did not remain present/,
+          );
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          const listPaneCalls = tmuxLog.match(/list-panes -t leader:0 -F #\{pane_id\}\t#\{pane_current_command\}\t#\{pane_start_command\}/g) || [];
+          assert.ok(listPaneCalls.length >= 2, tmuxLog);
+          assert.match(tmuxLog, /kill-pane -t %2/);
+        },
+      );
+    } finally {
+      if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevOstype === 'string') process.env.OSTYPE = prevOstype;
+      else delete process.env.OSTYPE;
+      if (typeof prevWsl === 'string') process.env.WSL_DISTRO_NAME = prevWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof prevWslInterop === 'string') process.env.WSL_INTEROP = prevWslInterop;
+      else delete process.env.WSL_INTEROP;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('restores standalone HUD panes with direct resize on native Windows', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-win32-hud-'));
+    const prevLeaderNodePath = process.env.OMX_LEADER_NODE_PATH;
+    const prevMsystem = process.env.MSYSTEM;
+    const prevOstype = process.env.OSTYPE;
+    const prevWsl = process.env.WSL_DISTRO_NAME;
+    const prevWslInterop = process.env.WSL_INTEROP;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-win32-standalone-hud-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  split-window)
+    echo "%44"
+    exit 0
+    ;;
+  resize-pane|select-pane)
+    exit 0
+    ;;
+  set-hook|run-shell)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          delete process.env.MSYSTEM;
+          delete process.env.OSTYPE;
+          delete process.env.WSL_DISTRO_NAME;
+          delete process.env.WSL_INTEROP;
+          process.env.OMX_LEADER_NODE_PATH = 'C:\\Program Files\\nodejs\\node.exe';
+          Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+          const paneId = restoreStandaloneHudPane('%11', cwd);
+          assert.equal(paneId, '%44');
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /'C:\\Program Files\\nodejs\\node\.exe'/);
+          assert.match(tmuxLog, new RegExp(`resize-pane -t %44 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
+          assert.match(tmuxLog, /select-pane -t %11/);
+          assert.doesNotMatch(tmuxLog, /run-shell -b sleep \d+; tmux resize-pane -t %44 -y \d+ >/);
+          assert.doesNotMatch(tmuxLog, /run-shell tmux resize-pane -t %44 -y \d+ >/);
+          assert.doesNotMatch(tmuxLog, /set-hook -t /);
+        },
+      );
+    } finally {
+      if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+      if (typeof prevLeaderNodePath === 'string') process.env.OMX_LEADER_NODE_PATH = prevLeaderNodePath;
+      else delete process.env.OMX_LEADER_NODE_PATH;
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevOstype === 'string') process.env.OSTYPE = prevOstype;
+      else delete process.env.OSTYPE;
+      if (typeof prevWsl === 'string') process.env.WSL_DISTRO_NAME = prevWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof prevWslInterop === 'string') process.env.WSL_INTEROP = prevWslInterop;
+      else delete process.env.WSL_INTEROP;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('reuses an existing standalone HUD pane across repeated restore calls', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-reuse-hud-'));
+
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-reuse-standalone-hud-',
+        (logPath) => {
+          const statePath = `${logPath}.state`;
+          return `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  list-panes)
+    printf '%%11\\tzsh\\tzsh\\n'
+    if [ -f "${statePath}" ]; then
+      printf "%%44\\tnode\\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%11' /node /omx.js hud --watch\\n"
+    fi
+    exit 0
+    ;;
+  split-window)
+    : > "${statePath}"
+    echo "%44"
+    exit 0
+    ;;
+  run-shell|select-pane|resize-pane|set-hook|kill-pane)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`;
+        },
+        async ({ logPath }) => {
+          const firstPaneId = restoreStandaloneHudPane('%11', cwd);
+          const secondPaneId = restoreStandaloneHudPane('%11', cwd);
+
+          assert.equal(firstPaneId, '%44');
+          assert.equal(secondPaneId, '%44');
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          const splitCount = (tmuxLog.match(/(^|\n)split-window /g) ?? []).length;
+          assert.equal(splitCount, 1);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %44/);
+          assert.match(tmuxLog, /list-panes -t %11 -F #\{pane_id\}\t#\{pane_current_command\}\t#\{pane_start_command\}/);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('restores standalone HUD panes from the live leader pane cwd with explicit session ownership', async () => {
+    const teamLaunchCwd = await mkdtemp(join(tmpdir(), 'omx-standalone-team-launch-cwd-'));
+    const leaderPaneCwd = await mkdtemp(join(tmpdir(), 'omx-standalone-leader-pane-cwd-'));
+
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-leader-cwd-standalone-hud-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  display-message)
+    case "$*" in
+      *"#{pane_current_path}"*)
+        echo "${leaderPaneCwd}"
+        ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    echo "%44"
+    exit 0
+    ;;
+  run-shell|select-pane|resize-pane|set-hook)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          const paneId = restoreStandaloneHudPane('%11', teamLaunchCwd, {
+            sessionId: 'current-session-for-hud',
+          });
+          assert.equal(paneId, '%44');
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /display-message -p -t %11 #\{pane_current_path\}/);
+          assert.match(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\\{pane_id\\} -c ${escapeRegExp(leaderPaneCwd)} `));
+          assert.doesNotMatch(tmuxLog, new RegExp(`split-window .* -c ${escapeRegExp(teamLaunchCwd)} `));
+          assert.match(
+            tmuxLog,
+            /exec env OMX_SESSION_ID='current-session-for-hud' OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%11' .*hud --watch/,
+          );
+        },
+      );
+    } finally {
+      await rm(teamLaunchCwd, { recursive: true, force: true });
+      await rm(leaderPaneCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to the team launch cwd when the live leader pane cwd is unusable', async () => {
+    const teamLaunchCwd = await mkdtemp(join(tmpdir(), 'omx-standalone-team-launch-cwd-fallback-'));
+    const deletedLeaderPaneCwd = await mkdtemp(join(tmpdir(), 'omx-standalone-deleted-leader-pane-cwd-'));
+    await rm(deletedLeaderPaneCwd, { recursive: true, force: true });
+
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-deleted-leader-cwd-standalone-hud-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  display-message)
+    case "$*" in
+      *"#{pane_current_path}"*)
+        echo "${deletedLeaderPaneCwd}"
+        ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *"-c ${teamLaunchCwd} "*)
+        echo "%44"
+        exit 0
+        ;;
+      *"-c ${deletedLeaderPaneCwd} "*)
+        echo "deleted cwd should not be used" >&2
+        exit 1
+        ;;
+      *)
+        echo "unexpected cwd: $*" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  run-shell|select-pane|resize-pane|set-hook)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          const paneId = restoreStandaloneHudPane('%11', teamLaunchCwd, {
+            sessionId: 'current-session-for-hud',
+          });
+          assert.equal(paneId, '%44');
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /display-message -p -t %11 #\{pane_current_path\}/);
+          assert.match(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\\{pane_id\\} -c ${escapeRegExp(teamLaunchCwd)} `));
+          assert.doesNotMatch(tmuxLog, new RegExp(`split-window .* -c ${escapeRegExp(deletedLeaderPaneCwd)} `));
+          assert.match(tmuxLog, /select-pane -t %11/);
+        },
+      );
+    } finally {
+      await rm(teamLaunchCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps MSYS drive-style live leader cwd candidates without raw stat prefiltering', async () => {
+    const liveLeaderCwd = '/c/live';
+    const fallbackCwd = 'C:\\fallback';
+    const fakeCygpathDir = await mkdtemp(join(tmpdir(), 'omx-msys-live-cygpath-'));
+    const previousPath = process.env.PATH;
+    const previousMsystem = process.env.MSYSTEM;
+    const previousOstype = process.env.OSTYPE;
+    const previousWsl = process.env.WSL_DISTRO_NAME;
+    const previousWslInterop = process.env.WSL_INTEROP;
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const statCalls: string[] = [];
+
+    try {
+      const cygpathPath = join(fakeCygpathDir, 'cygpath');
+      await writeFile(cygpathPath, '#!/bin/sh\nprintf "%s\\n" "$2"\n');
+      await chmod(cygpathPath, 0o755);
+      process.env.PATH = `${fakeCygpathDir}:${previousPath ?? ''}`;
+      process.env.MSYSTEM = 'MINGW64';
+      process.env.OSTYPE = 'msys';
+      delete process.env.WSL_DISTRO_NAME;
+      delete process.env.WSL_INTEROP;
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+      await withMockTmuxFixture(
+        'omx-tmux-msys-live-cwd-standalone-hud-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  display-message)
+    case "$*" in
+      *"#{pane_current_path}"*)
+        echo "${liveLeaderCwd}"
+        ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *"-c ${liveLeaderCwd} "*)
+        echo "%44"
+        exit 0
+        ;;
+      *"-c ${fallbackCwd} "*)
+        echo "fallback cwd should not be used when MSYS live cwd succeeds" >&2
+        exit 1
+        ;;
+      *)
+        echo "unexpected cwd: $*" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  run-shell|select-pane|resize-pane|set-hook)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          const paneId = withMockedStatSync(
+            ((pathLike: fs.PathLike) => {
+              const value = String(pathLike);
+              statCalls.push(value);
+              if (value === fallbackCwd) return { isDirectory: () => true } as fs.Stats;
+              return { isDirectory: () => false } as fs.Stats;
+            }) as typeof fs.statSync,
+            () => restoreStandaloneHudPane('%11', fallbackCwd, { sessionId: 'current-session-for-hud' }),
+          );
+          assert.equal(paneId, '%44');
+          assert.equal(statCalls.includes(liveLeaderCwd), false);
+          assert.equal(statCalls.includes(fallbackCwd), true);
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /display-message -p -t %11 #\{pane_current_path\}/);
+          assert.match(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\\{pane_id\\} -c ${escapeRegExp(liveLeaderCwd)} `));
+          assert.doesNotMatch(tmuxLog, new RegExp(`split-window .* -c ${escapeRegExp(fallbackCwd)} `));
+          assert.match(tmuxLog, /select-pane -t %11/);
+        },
+      );
+    } finally {
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      if (typeof previousMsystem === 'string') process.env.MSYSTEM = previousMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof previousOstype === 'string') process.env.OSTYPE = previousOstype;
+      else delete process.env.OSTYPE;
+      if (typeof previousWsl === 'string') process.env.WSL_DISTRO_NAME = previousWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof previousWslInterop === 'string') process.env.WSL_INTEROP = previousWslInterop;
+      else delete process.env.WSL_INTEROP;
+      await rm(fakeCygpathDir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back after an unusable MSYS drive-style live leader cwd split attempt fails', async () => {
+    const liveLeaderCwd = '/c/deleted-live';
+    const fallbackCwd = 'C:\\fallback';
+    const fakeCygpathDir = await mkdtemp(join(tmpdir(), 'omx-msys-deleted-live-cygpath-'));
+    const previousPath = process.env.PATH;
+    const previousMsystem = process.env.MSYSTEM;
+    const previousOstype = process.env.OSTYPE;
+    const previousWsl = process.env.WSL_DISTRO_NAME;
+    const previousWslInterop = process.env.WSL_INTEROP;
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const statCalls: string[] = [];
+
+    try {
+      const cygpathPath = join(fakeCygpathDir, 'cygpath');
+      await writeFile(cygpathPath, '#!/bin/sh\nprintf "%s\\n" "$2"\n');
+      await chmod(cygpathPath, 0o755);
+      process.env.PATH = `${fakeCygpathDir}:${previousPath ?? ''}`;
+      process.env.MSYSTEM = 'MINGW64';
+      process.env.OSTYPE = 'msys';
+      delete process.env.WSL_DISTRO_NAME;
+      delete process.env.WSL_INTEROP;
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+      await withMockTmuxFixture(
+        'omx-tmux-msys-deleted-live-cwd-standalone-hud-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  display-message)
+    case "$*" in
+      *"#{pane_current_path}"*)
+        echo "${liveLeaderCwd}"
+        ;;
+    esac
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *"-c ${liveLeaderCwd} "*)
+        echo "deleted live cwd cannot be used" >&2
+        exit 1
+        ;;
+      *"-c ${fallbackCwd} "*)
+        echo "%44"
+        exit 0
+        ;;
+      *)
+        echo "unexpected cwd: $*" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  run-shell|select-pane|resize-pane|set-hook)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          const paneId = withMockedStatSync(
+            ((pathLike: fs.PathLike) => {
+              const value = String(pathLike);
+              statCalls.push(value);
+              if (value === fallbackCwd) return { isDirectory: () => true } as fs.Stats;
+              return { isDirectory: () => false } as fs.Stats;
+            }) as typeof fs.statSync,
+            () => restoreStandaloneHudPane('%11', fallbackCwd, { sessionId: 'current-session-for-hud' }),
+          );
+          assert.equal(paneId, '%44');
+          assert.equal(statCalls.includes(liveLeaderCwd), false);
+          assert.equal(statCalls.includes(fallbackCwd), true);
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          const liveAttemptIndex = tmuxLog.indexOf(`-c ${liveLeaderCwd} `);
+          const fallbackAttemptIndex = tmuxLog.indexOf(`-c ${fallbackCwd} `);
+          assert.ok(liveAttemptIndex >= 0, 'deleted MSYS live cwd should still be attempted');
+          assert.ok(fallbackAttemptIndex > liveAttemptIndex, 'fallback should be attempted after live split failure');
+          assert.match(tmuxLog, /select-pane -t %11/);
+        },
+      );
+    } finally {
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      if (typeof previousMsystem === 'string') process.env.MSYSTEM = previousMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof previousOstype === 'string') process.env.OSTYPE = previousOstype;
+      else delete process.env.OSTYPE;
+      if (typeof previousWsl === 'string') process.env.WSL_DISTRO_NAME = previousWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof previousWslInterop === 'string') process.env.WSL_INTEROP = previousWslInterop;
+      else delete process.env.WSL_INTEROP;
+      await rm(fakeCygpathDir, { recursive: true, force: true });
+    }
+  });
+
+  it('restores standalone HUD panes with an absolute OMX entry path after cwd drift', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-relative-hud-'));
+    const startupCwd = await mkdtemp(join(tmpdir(), 'omx-standalone-relative-start-'));
+    const previousEntryPath = process.env[OMX_ENTRY_PATH_ENV];
+    const previousStartupCwd = process.env[OMX_STARTUP_CWD_ENV];
+    const previousArgv = process.argv;
+
+    try {
+      const launcherDir = join(startupCwd, 'dist', 'cli');
+      const launcherPath = join(launcherDir, 'omx.js');
+      await mkdir(launcherDir, { recursive: true });
+      await writeFile(launcherPath, '#!/usr/bin/env node\n');
+
+      await withMockTmuxFixture(
+        'omx-tmux-relative-standalone-hud-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  split-window)
+    echo "%44"
+    exit 0
+    ;;
+  run-shell|select-pane|resize-pane|set-hook)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          delete process.env[OMX_ENTRY_PATH_ENV];
+          process.env[OMX_STARTUP_CWD_ENV] = startupCwd;
+          process.argv = [previousArgv[0] || 'node', 'dist/cli/omx.js'];
+
+          const paneId = restoreStandaloneHudPane('%11', cwd);
+          assert.equal(paneId, '%44');
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, new RegExp(escapeRegExp(launcherPath)));
+          assert.doesNotMatch(tmuxLog, /'dist\/cli\/omx\.js' hud --watch/);
+          assert.match(tmuxLog, /exec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%11' .*hud --watch/);
+        },
+      );
+    } finally {
+      process.argv = previousArgv;
+      if (typeof previousEntryPath === 'string') process.env[OMX_ENTRY_PATH_ENV] = previousEntryPath;
+      else delete process.env[OMX_ENTRY_PATH_ENV];
+      if (typeof previousStartupCwd === 'string') process.env[OMX_STARTUP_CWD_ENV] = previousStartupCwd;
+      else delete process.env[OMX_STARTUP_CWD_ENV];
+      await rm(cwd, { recursive: true, force: true });
+      await rm(startupCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('restores standalone HUD panes with the packaged CLI entry when argv1 is not the OMX CLI', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-noncli-hud-'));
+    const previousArgv = process.argv;
+
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-noncli-standalone-hud-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  split-window)
+    echo "%44"
+    exit 0
+    ;;
+  run-shell|select-pane|resize-pane|set-hook)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          process.argv = [previousArgv[0] || 'node', '/tmp/codex-host-binary'];
+
+          const paneId = restoreStandaloneHudPane('%11', cwd);
+          assert.equal(paneId, '%44');
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /dist\/cli\/omx\.js' hud --watch/);
+          assert.doesNotMatch(tmuxLog, /\/tmp\/codex-host-binary' hud --watch/);
+          assert.match(tmuxLog, /exec env OMX_TMUX_HUD_OWNER=1 .*hud --watch/);
+        },
+      );
+    } finally {
+      process.argv = previousArgv;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('restores standalone HUD panes with OMX_ROOT forwarded and shell-escaped', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-root-hud-'));
+    const previousOmxRoot = process.env.OMX_ROOT;
+
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-root-standalone-hud-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  split-window)
+    echo "%44"
+    exit 0
+    ;;
+  run-shell|select-pane|resize-pane|set-hook)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          process.env.OMX_ROOT = "/tmp/boxed root/it's/$(literal)";
+
+          const paneId = restoreStandaloneHudPane('%11', cwd);
+          assert.equal(paneId, '%44');
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(
+            tmuxLog,
+            /exec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%11' OMX_ROOT='\/tmp\/boxed root\/it'\\''s\/\$\(literal\)' .*hud --watch/,
+          );
+        },
+      );
+    } finally {
+      if (typeof previousOmxRoot === 'string') process.env.OMX_ROOT = previousOmxRoot;
+      else delete process.env.OMX_ROOT;
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1545,6 +5033,37 @@ describe('isWorkerAlive', () => {
     withEmptyPath(() => {
       assert.equal(isWorkerAlive('omx-team-x', 1), false);
     });
+  });
+
+  it('treats an existing non-dead pane id as live even when pane_pid is unavailable', async () => {
+    await withMockTmuxFixture(
+      'omx-pane-id-liveness-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  list-panes)
+    if [ "$2" = "-a" ]; then
+      printf "%%77 0 \\n%%88 1 \\n"
+      exit 0
+    fi
+    exit 1
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`,
+      async () => {
+        assert.equal(isWorkerAlive('ignored-session', 1, '%77'), true);
+        assert.equal(isWorkerPaneOpen('ignored-session', 1, '%77'), true);
+        assert.equal(isWorkerAlive('ignored-session', 2, '%88'), false);
+      },
+    );
   });
 });
 
@@ -1822,6 +5341,13 @@ describe('enableMouseScrolling session scoping (issue #817)', () => {
       (tmuxLogPath) => `#!/bin/sh
 printf '%s\n' "$*" >> "${tmuxLogPath}"
 case "$1" in
+  show-options)
+    if [ "$2" = "-gv" ] && [ "$3" = "-t" ] && [ "$4" = "omx-team-x" ] && [ "$5" = "mode-style" ]; then
+      printf '%s\n' 'bg=yellow,fg=black,underscore'
+      exit 0
+    fi
+    exit 1
+    ;;
   set-option)
     if [ "$2" = "-t" ]; then
       exit 0
@@ -1838,8 +5364,58 @@ esac
         const tmuxLog = await readFile(logPath, 'utf-8');
         assert.match(tmuxLog, /set-option -t omx-team-x mouse on/);
         assert.match(tmuxLog, /set-option -t omx-team-x set-clipboard on/);
+        assert.match(
+          tmuxLog,
+          /set-option -t omx-team-x mode-style bg=yellow,fg=black,underscore,nounderscore,nodouble-underscore,nocurly-underscore,nodotted-underscore,nodashed-underscore/,
+        );
         assert.doesNotMatch(tmuxLog, /bind-key/);
         assert.doesNotMatch(tmuxLog, /terminal-overrides/);
+      },
+    );
+  });
+});
+
+describe('mitigateCopyModeUnderlineArtifacts', () => {
+  it('best-effort sanitizes copy-mode style options without requiring global tmux changes', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-sanitize-copy-style-',
+      (tmuxLogPath) => `#!/bin/sh
+printf '%s\n' "$*" >> "${tmuxLogPath}"
+case "$1" in
+  show-options)
+    if [ "$2" = "-gv" ] && [ "$3" = "-t" ] && [ "$4" = "omx-team-x" ] && [ "$5" = "mode-style" ]; then
+      printf '%s\n' 'bg=yellow,fg=black,underscore'
+      exit 0
+    fi
+    if [ "$2" = "-gv" ] && [ "$3" = "-t" ] && [ "$4" = "omx-team-x" ] && [ "$5" = "copy-mode-selection-style" ]; then
+      printf '%s\n' 'fg=white,bg=blue,curly-underscore'
+      exit 0
+    fi
+    exit 1
+    ;;
+  set-option)
+    if [ "$2" = "-t" ]; then
+      exit 0
+    fi
+    exit 1
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      async ({ logPath }) => {
+        assert.equal(mitigateCopyModeUnderlineArtifacts('omx-team-x'), true);
+        const tmuxLog = await readFile(logPath, 'utf-8');
+        assert.match(
+          tmuxLog,
+          /set-option -t omx-team-x mode-style bg=yellow,fg=black,underscore,nounderscore,nodouble-underscore,nocurly-underscore,nodotted-underscore,nodashed-underscore/,
+        );
+        assert.match(
+          tmuxLog,
+          /set-option -t omx-team-x copy-mode-selection-style fg=white,bg=blue,curly-underscore,nounderscore,nodouble-underscore,nocurly-underscore,nodotted-underscore,nodashed-underscore/,
+        );
+        assert.doesNotMatch(tmuxLog, /set-option -g/);
       },
     );
   });

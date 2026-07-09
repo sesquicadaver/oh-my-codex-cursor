@@ -11,8 +11,10 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { buildTmuxSessionName } from '../../cli/index.js';
 
 const NOTIFY_HOOK_SCRIPT = new URL('../../../dist/scripts/notify-hook.js', import.meta.url);
 
@@ -31,6 +33,31 @@ async function writeJson(path: string, value: unknown): Promise<void> {
 
 async function readJson<T>(path: string): Promise<T> {
   return JSON.parse(await readFile(path, 'utf-8')) as T;
+}
+
+function readLinuxStartTicks(pid: number): number | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
+    const commandEnd = stat.lastIndexOf(')');
+    if (commandEnd === -1) return null;
+    const remainder = stat.slice(commandEnd + 1).trim();
+    const fields = remainder.split(/\s+/);
+    if (fields.length <= 19) return null;
+    const startTicks = Number(fields[19]);
+    return Number.isFinite(startTicks) ? startTicks : null;
+  } catch {
+    return null;
+  }
+}
+
+function readLinuxCmdline(pid: number): string | null {
+  try {
+    const raw = readFileSync(`/proc/${pid}/cmdline`);
+    const text = raw.toString('utf-8').replace(/\0+/g, ' ').trim();
+    return text.length > 0 ? text : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Build a fake tmux binary that responds to all required commands.
@@ -72,7 +99,7 @@ if [[ "$cmd" == "display-message" ]]; then
     exit 0
   fi
   if [[ "$format" == "#S" ]]; then
-    echo "devsess"
+    echo "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}"
     exit 0
   fi
   if [[ "$format" == "#{pane_in_mode}" ]]; then
@@ -81,6 +108,21 @@ if [[ "$cmd" == "display-message" ]]; then
   fi
   echo "unsupported format: $format" >&2
   exit 1
+fi
+if [[ "$cmd" == "set-buffer" ]]; then
+  printf '%s' "\${@: -1}" > "${cwd}/tmux-buffer"
+  exit 0
+fi
+if [[ "$cmd" == "show-buffer" ]]; then
+  if [[ -f "${cwd}/tmux-buffer" ]]; then cat "${cwd}/tmux-buffer"; fi
+  exit 0
+fi
+if [[ "$cmd" == "paste-buffer" ]]; then
+  exit 0
+fi
+if [[ "$cmd" == "delete-buffer" ]]; then
+  rm -f "${cwd}/tmux-buffer"
+  exit 0
 fi
 if [[ "$cmd" == "send-keys" ]]; then
   exit 0
@@ -103,7 +145,15 @@ async function setupFixture(cwd: string, paneInMode: '0' | '1', skipIfScrolling 
   await mkdir(logsDir, { recursive: true });
   await mkdir(fakeBinDir, { recursive: true });
 
-  await writeJson(join(stateDir, 'session.json'), { session_id: sessionId });
+  await writeJson(join(stateDir, 'session.json'), {
+    session_id: sessionId,
+    started_at: new Date().toISOString(),
+    cwd,
+    pid: process.pid,
+    platform: process.platform,
+    pid_start_ticks: readLinuxStartTicks(process.pid),
+    pid_cmdline: readLinuxCmdline(process.pid),
+  });
   await writeJson(join(sessionStateDir, 'ralph-state.json'), { active: true, iteration: 0 });
   await writeJson(join(omxDir, 'tmux-hook.json'), {
     enabled: true,
@@ -139,6 +189,8 @@ function runNotifyHook(cwd: string, fakeBinDir: string, threadId: string) {
       ...process.env,
       PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
       OMX_TEAM_WORKER: '',
+      OMX_SESSION_ID: 'omx-scroll-test',
+      OMX_TEST_TMUX_SESSION_NAME: buildTmuxSessionName(cwd, 'omx-scroll-test'),
       TMUX_PANE: '%42',
     },
   });
@@ -153,8 +205,8 @@ describe('notify-hook tmux scrollback preservation (issue #215)', () => {
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
       const state = await readJson<Record<string, unknown>>(hookStatePath);
-      assert.equal(state.last_reason, 'injection_sent', 'current implementation proceeds in this fixture');
-      assert.equal(state.total_injections, 1, 'injection is counted');
+      assert.equal(state.last_reason, 'scroll_active', 'should preserve scrollback by skipping injection in copy-mode');
+      assert.equal(state.total_injections ?? 0, 0, 'scroll-active skip should not increment injection count');
     });
   });
 
@@ -191,7 +243,7 @@ describe('notify-hook tmux scrollback preservation (issue #215)', () => {
 
       runNotifyHook(cwd, fakeBinDir, 'thread-scroll-4');
       const stateAfterSkip = await readJson<Record<string, unknown>>(hookStatePath);
-      assert.equal(stateAfterSkip.last_reason, 'injection_sent');
+      assert.equal(stateAfterSkip.last_reason, 'scroll_active');
     });
   });
 });

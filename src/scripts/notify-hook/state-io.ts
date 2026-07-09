@@ -2,12 +2,11 @@
  * State file I/O helpers for notify-hook modules.
  */
 
-import { readFile, readdir } from 'fs/promises';
-import { existsSync } from 'fs';
-import { join } from 'path';
+import { mkdir, readFile, readdir, writeFile } from 'fs/promises';
+import { dirname, join } from 'path';
+import { validateSessionId } from '../../mcp/state-paths.js';
 import { asNumber, safeString } from './utils.js';
 
-const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 export { readdir };
 
@@ -17,25 +16,149 @@ export function readJsonIfExists(path: string, fallback: any): Promise<any> {
     .catch(() => fallback);
 }
 
-export async function getScopedStateDirsForCurrentSession(baseStateDir: string, payloadSessionId?: any): Promise<string[]> {
-  const explicitSessionId = safeString(payloadSessionId || '');
-  if (SESSION_ID_PATTERN.test(explicitSessionId)) {
-    const sessionDir = join(baseStateDir, 'sessions', explicitSessionId);
-    return [sessionDir];
-  }
+function isSafeStateFileName(fileName: string): boolean {
+  return fileName.length > 0
+    && !fileName.includes('..')
+    && !fileName.includes('/')
+    && !fileName.includes('\\');
+}
 
-  const sessionPath = join(baseStateDir, 'session.json');
+interface SessionMetadata {
+  sessionId?: string;
+  nativeAliases: string[];
+}
+
+async function readSessionMetadataFromBaseStateDir(baseStateDir: string): Promise<SessionMetadata> {
+  const session = await readJsonIfExists(join(baseStateDir, 'session.json'), null);
+  let sessionId: string | undefined;
   try {
-    const session = JSON.parse(await readFile(sessionPath, 'utf-8'));
-    const sessionId = safeString(session && session.session_id ? session.session_id : '');
-    if (SESSION_ID_PATTERN.test(sessionId)) {
-      const sessionDir = join(baseStateDir, 'sessions', sessionId);
-      if (existsSync(sessionDir)) return [sessionDir];
-    }
+    sessionId = validateSessionId(session?.session_id);
   } catch {
-    // No session file or malformed - fall back to global only
+    sessionId = undefined;
   }
-  return [baseStateDir];
+  const nativeAliases = [
+    session?.native_session_id,
+    session?.codex_session_id,
+    session?.previous_native_session_id,
+  ]
+    .map((value) => safeString(value).trim())
+    .filter(Boolean);
+  return { sessionId, nativeAliases: [...new Set(nativeAliases)] };
+}
+
+function readSessionIdFromEnvironment(): string | undefined {
+  for (const candidate of [process.env.OMX_SESSION_ID, process.env.CODEX_SESSION_ID, process.env.SESSION_ID]) {
+    if (typeof candidate !== 'string') continue;
+    const trimmed = candidate.trim();
+    if (!trimmed) continue;
+    try {
+      const sessionId = validateSessionId(trimmed);
+      if (sessionId) return sessionId;
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+}
+
+function resolveCanonicalSessionId(candidate: string | undefined, metadata: SessionMetadata): string | undefined {
+  if (!candidate) return undefined;
+  return metadata.sessionId && metadata.nativeAliases.includes(candidate)
+    ? metadata.sessionId
+    : candidate;
+}
+
+async function resolveBaseScopedStateDir(
+  baseStateDir: string,
+  explicitSessionId?: string,
+): Promise<string> {
+  const normalizedExplicit = typeof explicitSessionId === 'string' && explicitSessionId.trim()
+    ? explicitSessionId.trim()
+    : undefined;
+  const validatedExplicit = validateSessionId(normalizedExplicit);
+  const metadata = await readSessionMetadataFromBaseStateDir(baseStateDir);
+  const sessionId = resolveCanonicalSessionId(validatedExplicit, metadata)
+    ?? resolveCanonicalSessionId(readSessionIdFromEnvironment(), metadata)
+    ?? metadata.sessionId;
+  return sessionId ? join(baseStateDir, 'sessions', sessionId) : baseStateDir;
+}
+
+async function resolveBaseScopedStateDirs(
+  baseStateDir: string,
+  explicitSessionId?: string,
+  options: { includeRootFallback?: boolean } = {},
+): Promise<string[]> {
+  const scopedDir = await resolveBaseScopedStateDir(baseStateDir, explicitSessionId);
+  return options.includeRootFallback === true && scopedDir !== baseStateDir
+    ? [scopedDir, baseStateDir]
+    : [scopedDir];
+}
+
+
+
+
+export async function readCurrentSessionId(baseStateDir: string): Promise<string | undefined> {
+  const metadata = await readSessionMetadataFromBaseStateDir(baseStateDir);
+  return resolveCanonicalSessionId(readSessionIdFromEnvironment(), metadata) ?? metadata.sessionId;
+}
+
+export async function resolveScopedStateDir(
+  baseStateDir: string,
+  explicitSessionId?: string,
+): Promise<string> {
+  return resolveBaseScopedStateDir(baseStateDir, explicitSessionId);
+}
+
+export async function getScopedStateDirsForCurrentSession(
+  baseStateDir: string,
+  explicitSessionId?: string,
+  options: { includeRootFallback?: boolean } = {},
+): Promise<string[]> {
+  return resolveBaseScopedStateDirs(baseStateDir, explicitSessionId, options);
+}
+
+export async function getScopedStatePath(
+  baseStateDir: string,
+  fileName: string,
+  explicitSessionId?: string,
+): Promise<string> {
+  if (!isSafeStateFileName(fileName)) {
+    throw new Error(`unsafe state file name: ${fileName}`);
+  }
+  return join(await resolveScopedStateDir(baseStateDir, explicitSessionId), fileName);
+}
+
+export async function readScopedJsonIfExists(
+  baseStateDir: string,
+  fileName: string,
+  explicitSessionId: string | undefined,
+  fallback: any,
+  options: { includeRootFallback?: boolean } = {},
+): Promise<any> {
+  if (!isSafeStateFileName(fileName)) {
+    throw new Error(`unsafe state file name: ${fileName}`);
+  }
+  const candidateDirs = await getScopedStateDirsForCurrentSession(
+    baseStateDir,
+    explicitSessionId,
+    options,
+  );
+  for (const dir of candidateDirs) {
+    const value = await readJsonIfExists(join(dir, fileName), fallback);
+    if (value !== fallback) return value;
+  }
+  return fallback;
+}
+
+export async function writeScopedJson(
+  baseStateDir: string,
+  fileName: string,
+  explicitSessionId: string | undefined,
+  value: unknown,
+): Promise<void> {
+  const targetPath = await getScopedStatePath(baseStateDir, fileName, explicitSessionId);
+  await mkdir(dirname(targetPath), { recursive: true });
+  await writeFile(targetPath, JSON.stringify(value, null, 2));
 }
 
 export function normalizeTmuxState(raw: any): any {

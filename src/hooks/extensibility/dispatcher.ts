@@ -3,6 +3,12 @@ import { existsSync } from "fs";
 import { appendFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { getPackageRoot } from "../../utils/package.js";
+import { omxRoot } from "../../utils/paths.js";
+import {
+	createLifecycleBroadcastFingerprint,
+	recordLifecycleHookBroadcastSent,
+	shouldSendLifecycleHookBroadcast,
+} from "../../notifications/lifecycle-dedupe.js";
 import {
 	discoverHookPlugins,
 	isHookPluginsEnabled,
@@ -27,14 +33,14 @@ const RUNNER_SIGKILL_GRACE_MS = 250;
 
 function hooksLogPath(cwd: string): string {
 	const day = new Date().toISOString().slice(0, 10);
-	return join(cwd, ".omx", "logs", `hooks-${day}.jsonl`);
+	return join(omxRoot(cwd), "logs", `hooks-${day}.jsonl`);
 }
 
 async function appendHooksLog(
 	cwd: string,
 	payload: Record<string, unknown>,
 ): Promise<void> {
-	await mkdir(join(cwd, ".omx", "logs"), { recursive: true });
+	await mkdir(join(omxRoot(cwd), "logs"), { recursive: true });
 	await appendFile(
 		hooksLogPath(cwd),
 		`${JSON.stringify({ timestamp: new Date().toISOString(), ...payload })}\n`,
@@ -89,6 +95,7 @@ async function runPluginRunner(
 		const child = spawn(process.execPath, [runnerPath], {
 			cwd: options.cwd,
 			stdio: ["pipe", "pipe", "pipe"],
+			windowsHide: true,
 			env: {
 				...process.env,
 				...(options.env || {}),
@@ -101,17 +108,33 @@ async function runPluginRunner(
 		let timedOut = false;
 		let sigkillTimer: NodeJS.Timeout | undefined;
 
+		const onStdoutData = (chunk: Buffer) => {
+			stdout += chunk.toString();
+		};
+		const onStderrData = (chunk: Buffer) => {
+			stderr += chunk.toString();
+		};
+		let onError: ((error: Error) => void) | undefined;
+		let onClose: (() => void) | undefined;
+		const cleanup = (clearSigkillTimer = true) => {
+			clearTimeout(timer);
+			if (clearSigkillTimer && sigkillTimer) {
+				clearTimeout(sigkillTimer);
+				sigkillTimer = undefined;
+			}
+			child.stdout.off("data", onStdoutData);
+			child.stderr.off("data", onStderrData);
+			if (onError) child.off("error", onError);
+			if (onClose) child.off("close", onClose);
+		};
+
 		const settle = (
 			result: HookPluginDispatchResult,
 			clearSigkillTimer = true,
 		) => {
 			if (done) return;
 			done = true;
-			clearTimeout(timer);
-			if (clearSigkillTimer && sigkillTimer) {
-				clearTimeout(sigkillTimer);
-				sigkillTimer = undefined;
-			}
+			cleanup(clearSigkillTimer);
 			resolve(result);
 		};
 
@@ -148,15 +171,10 @@ async function runPluginRunner(
 			);
 		}, timeoutMs);
 
-		child.stdout.on("data", (chunk) => {
-			stdout += chunk.toString();
-		});
+		child.stdout.on("data", onStdoutData);
+		child.stderr.on("data", onStderrData);
 
-		child.stderr.on("data", (chunk) => {
-			stderr += chunk.toString();
-		});
-
-		child.on("error", (error) => {
+		onError = (error) => {
 			const duration = Date.now() - started;
 			settle({
 				plugin: plugin.id,
@@ -170,9 +188,10 @@ async function runPluginRunner(
 				durationMs: duration,
 				duration_ms: duration,
 			});
-		});
+		};
+		child.on("error", onError);
 
-		child.on("close", () => {
+		onClose = () => {
 			if (done) return;
 			const duration = Date.now() - started;
 
@@ -237,7 +256,8 @@ async function runPluginRunner(
 				durationMs: duration,
 				duration_ms: duration,
 			});
-		});
+		};
+		child.on("close", onClose);
 
 		child.stdin.write(
 			JSON.stringify({
@@ -262,6 +282,26 @@ function shouldForceEnableRuntimeHookDispatch(
 	event: HookEventEnvelope,
 ): boolean {
 	return event.source === "native" || event.source === "derived";
+}
+
+function shouldDedupeHookEvent(event: HookEventEnvelope): boolean {
+	if (event.source !== "native") return false;
+	return event.event === "session-start"
+		|| event.event === "stop"
+		|| event.event === "session-end"
+		|| event.event === "keyword-detector";
+}
+
+function buildHookEventFingerprint(event: HookEventEnvelope): string {
+	return createLifecycleBroadcastFingerprint({
+		event: event.event,
+		source: event.source,
+		session_id: event.session_id || "",
+		thread_id: event.thread_id || "",
+		turn_id: event.turn_id || "",
+		mode: event.mode || "",
+		context: event.context,
+	});
 }
 
 export async function dispatchHookEvent(
@@ -290,6 +330,32 @@ export async function dispatchHookEvent(
 			source: event.source,
 			enabled: false,
 			reason: "plugins_disabled",
+		});
+		return summary;
+	}
+
+	const dedupeFingerprint = shouldDedupeHookEvent(event)
+		? buildHookEventFingerprint(event)
+		: "";
+	if (
+		dedupeFingerprint
+		&& !shouldSendLifecycleHookBroadcast(
+			join(omxRoot(cwd), "state"),
+			event.session_id,
+			event.event,
+			dedupeFingerprint,
+		)
+	) {
+		summary.reason = "deduped";
+		await appendHooksLog(cwd, {
+			type: "hook_dispatch",
+			event: event.event,
+			source: event.source,
+			enabled: true,
+			reason: "deduped",
+			session_id: event.session_id || null,
+			thread_id: event.thread_id || null,
+			turn_id: event.turn_id || null,
 		});
 		return summary;
 	}
@@ -324,6 +390,15 @@ export async function dispatchHookEvent(
 			error: result.error,
 			duration_ms: result.duration_ms,
 		});
+	}
+
+	if (dedupeFingerprint && summary.results.some((result) => result.ok)) {
+		recordLifecycleHookBroadcastSent(
+			join(omxRoot(cwd), "state"),
+			event.session_id,
+			event.event,
+			dedupeFingerprint,
+		);
 	}
 
 	return summary;

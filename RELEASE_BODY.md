@@ -1,41 +1,30 @@
-# oh-my-codex v0.11.10
+# oh-my-codex 0.19.0
 
-**Patch release for approved handoff alias parsing hardening and clean release metadata sync**
+> Release status: candidate. Publication proof is recorded in `docs/qa/release-readiness-0.19.0.md`; this body is finalized after dev/main CI, tag workflow, GitHub release, native asset, and npm publication evidence are complete.
 
-`0.11.10` follows `0.11.9` with a deliberately narrow release: it locks approved execution handoff parsing against quoting regressions for both Ralph and Team alias forms, then cuts a clean metadata-aligned patch release.
+`0.19.0` is a reliability and safety-hardening release after `0.18.17`. It preserves the existing CLI/package/plugin contract while locking down planning-gate and handoff-artifact execution transports, hardening the conductor contract and typed subagent/lane provenance, tightening Ralplan consensus/terminal-state handling, fixing madmax worktree and resume paths, and eliminating a long-standing parallel-test flake in the Rust suite.
 
 ## Highlights
 
-- Approved `$ralph` launch hints are now protected by single-quoted regression coverage.
-- Approved `$team` launch hints are now protected by single-quoted regression coverage.
-- Node and Cargo release metadata are synchronized to `0.11.10` for a clean release cut.
+- Lock down planning-gate and handoff-artifact execution transports while still allowing legitimate deep-interview→ralplan artifact handoff.
+- Harden the conductor contract, typed subagent provenance, typed-lane fences, shell-guard target parsing, and conductor reuse ledger.
+- Tighten Ralplan consensus review evidence, terminal closeout state writes, and heredoc redirect scanning.
+- Fix Autopilot ralplan handoff, madmax worktree runtime roots, and madmax resume plugin cache preflight.
+- Render superseded Ultragoal goals correctly in the HUD.
+- Eliminate the intermittent Rust sparkshell test flake by making `unique_temp_dir()` collision-proof under parallel same-process execution.
 
-## What’s Changed
+## Compatibility
 
-### Fixes
-- add regression coverage for single-quoted approved `$ralph` launch hints in planning artifact parsing
-- add regression coverage for single-quoted approved `$team` launch hints in planning artifact parsing
+No breaking CLI, package, plugin-layout, or configuration changes are intended.
 
-### Changed
-- bump release metadata from `0.11.9` to `0.11.10` across the Node and Cargo packages
-- refresh `CHANGELOG.md`, `docs/release-notes-0.11.10.md`, and `RELEASE_BODY.md` for the release cut
+## Validation
 
-## Verification
+Release readiness evidence is recorded in `docs/qa/release-readiness-0.19.0.md`.
 
-- `npx biome lint src/planning/__tests__/artifacts.test.ts`
-- `npm run build && node --test dist/planning/__tests__/artifacts.test.js`
-- `npm run test:sparkshell`
-- `npm run test:team:cross-rebase-smoke`
-- `npm run smoke:packed-install`
-- `npm test`
-
-## Remaining risk
-
-- This release is intentionally narrow and centered on regression coverage plus metadata synchronization.
-- Future approved handoff grammar changes should keep alias-form coverage aligned across both Ralph and Team paths.
+Release-prep gates include version sync for `v0.19.0`, build, native-agent verification, plugin mirror/bundle checks, catalog docs check, the full Rust and node test suites (Rust rerun repeatedly to prove the flake fix), `npm pack --dry-run`, and `git diff --check`. Branch CI, dev/main promotion, tag-triggered release workflow, GitHub release proof, and npm publication proof are appended to readiness evidence after publication.
 
 ## Contributors
 
-- [@Yeachan-Heo](https://github.com/Yeachan-Heo) (Bellman)
+Thanks to the contributors who made this release possible.
 
-**Full Changelog**: [`v0.11.9...v0.11.10`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.11.9...v0.11.10)
+**Full Changelog**: [`v0.18.17...v0.19.0`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.18.17...v0.19.0)

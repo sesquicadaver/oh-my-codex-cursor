@@ -1,26 +1,38 @@
 import {
-  existsSync,
-  lstatSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
-  symlinkSync,
 } from 'node:fs';
 import { mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import {
+  ensureReusableNodeModules,
+} from '../utils/repo-deps.js';
 
-const REQUIRED_NODE_MODULE_MARKERS = [
-  join('typescript', 'package.json'),
-  join('@iarna', 'toml', 'package.json'),
-  join('@modelcontextprotocol', 'sdk', 'package.json'),
-  join('zod', 'package.json'),
-];
+export {
+  hasUsableNodeModules,
+  resolveGitCommonDir,
+  resolveReusableNodeModulesSource,
+} from '../utils/repo-deps.js';
 
 export const PACKED_INSTALL_SMOKE_CORE_COMMANDS = [
   ['--help'],
   ['version'],
+  ['api', '--help'],
+  ['sparkshell', '--help'],
+] as const;
+
+export const PACKED_INSTALL_NATIVE_HOOK_SMOKE_EVENTS = [
+  'SessionStart',
+  'PreToolUse',
+  'PostToolUse',
+  'UserPromptSubmit',
+  'PreCompact',
+  'PostCompact',
+  'Stop',
 ] as const;
 
 function usage(): string {
@@ -32,65 +44,16 @@ function usage(): string {
   ].join('\n');
 }
 
-function hasNodeModulesPath(nodeModulesPath: string): boolean {
-  try {
-    lstatSync(nodeModulesPath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export function hasUsableNodeModules(repoRoot: string): boolean {
-  return REQUIRED_NODE_MODULE_MARKERS.every((marker) => existsSync(join(repoRoot, 'node_modules', marker)));
-}
-
-export function resolveGitCommonDir(cwd: string, gitRunner = spawnSync): string | null {
-  const result = gitRunner('git', ['rev-parse', '--git-common-dir'], {
-    cwd,
-    encoding: 'utf-8',
-  });
-  if (result.status !== 0) {
-    return null;
-  }
-  const value = (result.stdout || '').trim();
-  if (!value) {
-    return null;
-  }
-  return resolve(cwd, value);
-}
-
 interface EnsureRepoDepsOptions {
   gitRunner?: typeof spawnSync;
   install?: (cwd: string) => void;
-  remove?: typeof rmSync;
-  symlink?: typeof symlinkSync;
   log?: (message: string) => void;
-  platformName?: string;
 }
 
 interface EnsureRepoDepsResult {
   strategy: string;
   nodeModulesPath: string;
   sourceNodeModulesPath?: string;
-}
-
-export function resolveReusableNodeModulesSource(repoRoot: string, gitRunner = spawnSync): string | null {
-  const commonDir = resolveGitCommonDir(repoRoot, gitRunner);
-  if (!commonDir || basename(commonDir) !== '.git') {
-    return null;
-  }
-
-  const primaryRepoRoot = dirname(commonDir);
-  if (resolve(primaryRepoRoot) === resolve(repoRoot)) {
-    return null;
-  }
-
-  if (!hasUsableNodeModules(primaryRepoRoot)) {
-    return null;
-  }
-
-  return join(primaryRepoRoot, 'node_modules');
 }
 
 function formatCommandFailure(cmd: string, args: string[], result: { stdout?: string; stderr?: string }): string {
@@ -114,40 +77,23 @@ export function ensureRepoDependencies(repoRoot: string, options: EnsureRepoDeps
         throw new Error(formatCommandFailure('npm', ['ci'], result));
       }
     },
-    remove = rmSync,
-    symlink = symlinkSync,
     log = () => {},
-    platformName = process.platform,
   } = options;
 
-  if (hasUsableNodeModules(repoRoot)) {
-    return {
-      strategy: 'existing',
-      nodeModulesPath: join(repoRoot, 'node_modules'),
-    };
+  const reusable = ensureReusableNodeModules(repoRoot, { gitRunner });
+  if (reusable.strategy === 'existing') {
+    return reusable;
   }
-
-  const targetNodeModules = join(repoRoot, 'node_modules');
-  if (hasNodeModulesPath(targetNodeModules)) {
-    remove(targetNodeModules, { recursive: true, force: true });
-  }
-
-  const reusableNodeModules = resolveReusableNodeModulesSource(repoRoot, gitRunner);
-  if (reusableNodeModules) {
-    symlink(reusableNodeModules, targetNodeModules, platformName === 'win32' ? 'junction' : 'dir');
-    log(`[smoke:packed-install] Reusing node_modules from ${reusableNodeModules}`);
-    return {
-      strategy: 'symlink',
-      nodeModulesPath: targetNodeModules,
-      sourceNodeModulesPath: reusableNodeModules,
-    };
+  if (reusable.strategy === 'symlink') {
+    log(`[smoke:packed-install] Reusing node_modules from ${reusable.sourceNodeModulesPath}`);
+    return reusable;
   }
 
   log('[smoke:packed-install] Installing repo dependencies with npm ci');
   install(repoRoot);
   return {
     strategy: 'installed',
-    nodeModulesPath: targetNodeModules,
+    nodeModulesPath: join(repoRoot, 'node_modules'),
   };
 }
 
@@ -177,6 +123,108 @@ function npmBinName(name: string): string {
   return process.platform === 'win32' ? `${name}.cmd` : name;
 }
 
+function resolveGlobalNodeModules(prefixDir: string): string {
+  const result = run('npm', ['root', '-g', '--prefix', prefixDir], { cwd: prefixDir });
+  const root = String(result.stdout || '').trim();
+  if (!root) throw new Error('npm root -g did not return a node_modules directory');
+  return root;
+}
+
+export function validateHookStdout(eventName: string, stdout: string): void {
+  const trimmed = stdout.trim();
+  if (!trimmed) return;
+  try {
+    JSON.parse(trimmed);
+  } catch (error) {
+    throw new Error(
+      `native hook ${eventName} emitted invalid JSON stdout: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+export function buildNativeHookSmokePayload(
+  eventName: typeof PACKED_INSTALL_NATIVE_HOOK_SMOKE_EVENTS[number],
+  smokeCwd: string,
+): Record<string, unknown> {
+  const base = {
+    hook_event_name: eventName,
+    session_id: `packed-install-smoke-${eventName}`,
+    cwd: smokeCwd,
+  };
+  switch (eventName) {
+    case 'SessionStart':
+      return {
+        ...base,
+        transcript_path: join(smokeCwd, 'nonexistent-transcript.jsonl'),
+      };
+    case 'PreToolUse':
+      return {
+        ...base,
+        tool_name: 'Bash',
+        tool_use_id: 'packed-install-smoke-tool',
+        tool_input: { command: 'echo packed install smoke' },
+      };
+    case 'PostToolUse':
+      return {
+        ...base,
+        tool_name: 'Bash',
+        tool_use_id: 'packed-install-smoke-tool',
+        tool_input: { command: 'echo packed install smoke' },
+        tool_response: {
+          exit_code: 0,
+          stdout: 'packed install smoke\n',
+          stderr: '',
+        },
+      };
+    case 'UserPromptSubmit':
+      return {
+        ...base,
+        transcript_path: join(smokeCwd, 'nonexistent-transcript.jsonl'),
+        prompt: 'packed install native hook smoke test',
+      };
+    case 'PreCompact':
+    case 'PostCompact':
+    case 'Stop':
+      return base;
+  }
+}
+
+function smokeInstalledNativeHookDist(prefixDir: string): void {
+  const globalNodeModules = resolveGlobalNodeModules(prefixDir);
+  const packageRoot = join(globalNodeModules, 'oh-my-codex');
+  const hookScript = join(packageRoot, 'dist', 'scripts', 'codex-native-hook.js');
+  const smokeCwd = mkdtempSync(join(tmpdir(), 'omx-packed-hook-smoke-'));
+  try {
+    for (const eventName of PACKED_INSTALL_NATIVE_HOOK_SMOKE_EVENTS) {
+      const payload = buildNativeHookSmokePayload(eventName, smokeCwd);
+      const result = run(process.execPath, [realpathSync(hookScript)], {
+        cwd: smokeCwd,
+        env: {
+          ...process.env,
+          OMX_NATIVE_HOOK_DOCTOR_SMOKE: '1',
+          OMX_ROOT: join(smokeCwd, '.omx-packed-hook-root'),
+          OMX_SESSION_ID: `packed-install-smoke-${eventName}`,
+          OMX_SOURCE_CWD: smokeCwd,
+          OMX_STARTUP_CWD: smokeCwd,
+        },
+        input: JSON.stringify(payload),
+      });
+      validateHookStdout(eventName, result.stdout as string);
+    }
+  } finally {
+    rmSync(smokeCwd, { recursive: true, force: true });
+  }
+}
+
+export function parseNpmPackJsonOutput(stdout: string): Array<{ filename: string }> {
+  const start = stdout.lastIndexOf('\n[');
+  const jsonText = (start >= 0 ? stdout.slice(start + 1) : stdout).trim();
+  if (!jsonText.startsWith('[')) {
+    throw new Error(`npm pack did not return JSON output: ${stdout.trim()}`);
+  }
+  return JSON.parse(jsonText) as Array<{ filename: string }>;
+}
+
 async function main(): Promise<void> {
   parseArgs(process.argv.slice(2));
 
@@ -192,7 +240,7 @@ async function main(): Promise<void> {
     });
 
     const pack = run('npm', ['pack', '--json'], { cwd: repoRoot });
-    const packOutput = JSON.parse((pack.stdout as string).slice((pack.stdout as string).indexOf('['))) as Array<{ filename: string }>;
+    const packOutput = parseNpmPackJsonOutput(pack.stdout as string);
     const tarballName = packOutput[0]?.filename;
     if (!tarballName) throw new Error('npm pack did not return a tarball filename');
     tarballPath = join(repoRoot, tarballName);
@@ -203,6 +251,7 @@ async function main(): Promise<void> {
     for (const argv of PACKED_INSTALL_SMOKE_CORE_COMMANDS) {
       run(omxPath, argv, { cwd: repoRoot });
     }
+    smokeInstalledNativeHookDist(prefixDir);
 
     console.log('packed install smoke: PASS');
   } finally {

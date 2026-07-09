@@ -1,16 +1,19 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile } from 'fs/promises';
+import { mkdir, mkdtemp, rm, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
+import { readModeState } from '../../modes/base.js';
 import {
   runPipeline,
   canResumePipeline,
   readPipelineState,
   cancelPipeline,
   createAutopilotPipelineConfig,
+  createStrictAutopilotStages,
 } from '../orchestrator.js';
+import { createRalplanStage } from '../stages/ralplan.js';
 import type { PipelineConfig, PipelineStage, StageContext, StageResult } from '../types.js';
 
 // ---------------------------------------------------------------------------
@@ -61,6 +64,28 @@ function makeThrowingStage(name: string, message: string): PipelineStage {
 }
 
 let tempDir: string;
+let savedOmxEnv: Pick<NodeJS.ProcessEnv, 'OMX_ROOT' | 'OMX_STATE_ROOT' | 'OMX_TEAM_STATE_ROOT' | 'OMX_SESSION_ID'>;
+
+function clearAmbientOmxEnv(): void {
+  savedOmxEnv = {
+    OMX_ROOT: process.env.OMX_ROOT,
+    OMX_STATE_ROOT: process.env.OMX_STATE_ROOT,
+    OMX_TEAM_STATE_ROOT: process.env.OMX_TEAM_STATE_ROOT,
+    OMX_SESSION_ID: process.env.OMX_SESSION_ID,
+  };
+  delete process.env.OMX_ROOT;
+  delete process.env.OMX_STATE_ROOT;
+  delete process.env.OMX_TEAM_STATE_ROOT;
+  delete process.env.OMX_SESSION_ID;
+}
+
+function restoreAmbientOmxEnv(): void {
+  for (const key of ['OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT', 'OMX_SESSION_ID'] as const) {
+    const value = savedOmxEnv[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
 
 async function setup(): Promise<string> {
   tempDir = await mkdtemp(join(tmpdir(), 'omx-pipeline-test-'));
@@ -79,11 +104,13 @@ async function cleanup(): Promise<void> {
 
 describe('Pipeline Orchestrator', () => {
   beforeEach(async () => {
+    clearAmbientOmxEnv();
     await setup();
   });
 
   afterEach(async () => {
     await cleanup();
+    restoreAmbientOmxEnv();
   });
 
   describe('runPipeline', () => {
@@ -127,6 +154,311 @@ describe('Pipeline Orchestrator', () => {
       assert.equal(result.status, 'completed');
       assert.deepEqual(order, ['stage-a', 'stage-b', 'stage-c']);
       assert.equal(Object.keys(result.stageResults).length, 3);
+    });
+
+
+
+    it('returns to ralplan when code-review is not clean', async () => {
+      const order: string[] = [];
+      let reviewRuns = 0;
+      const stages: PipelineStage[] = [
+        {
+          name: 'ralplan',
+          async run(): Promise<StageResult> {
+            order.push('ralplan');
+            return { status: 'completed', artifacts: { plan: `cycle-${order.length}` }, duration_ms: 0 };
+          },
+        },
+        {
+          name: 'ralph',
+          async run(): Promise<StageResult> {
+            order.push('ralph');
+            return { status: 'completed', artifacts: { implemented: true }, duration_ms: 0 };
+          },
+        },
+        {
+          name: 'code-review',
+          async run(): Promise<StageResult> {
+            order.push('code-review');
+            reviewRuns += 1;
+            const clean = reviewRuns > 1;
+            return {
+              status: 'completed',
+              artifacts: {
+                review_verdict: {
+                  recommendation: clean ? 'APPROVE' : 'REQUEST CHANGES',
+                  architectural_status: 'CLEAR',
+                  clean,
+                  stage: 'code-review',
+                  artifact_path: '.omx/reviews/review-loop.json',
+                },
+                return_to_ralplan_reason: clean ? null : 'Review requested a plan update.',
+              },
+              duration_ms: 0,
+            };
+          },
+        },
+        {
+          name: 'ultraqa',
+          async run(): Promise<StageResult> {
+            order.push('ultraqa');
+            return {
+              status: 'completed',
+              artifacts: {
+                qa_verdict: { stage: 'ultraqa', clean: true, skipped: false, url: 'https://github.com/Yeachan-Heo/oh-my-codex/actions/runs/1' },
+                return_to_ralplan_reason: null,
+              },
+              duration_ms: 0,
+            };
+          },
+        },
+      ];
+
+      const result = await runPipeline({
+        name: 'review-loop-test',
+        task: 'loop until review clean',
+        stages,
+        cwd: tempDir,
+        maxRalphIterations: 3,
+      });
+
+      assert.equal(result.status, 'completed');
+      assert.deepEqual(order, ['ralplan', 'ralph', 'code-review', 'ralplan', 'ralph', 'code-review', 'ultraqa']);
+
+      const ext = await readPipelineState(tempDir);
+      assert.equal(ext?.review_cycle, 1);
+      assert.equal((ext?.review_verdict as { clean?: boolean } | undefined)?.clean, true);
+      assert.equal(ext?.return_to_ralplan_reason, null);
+      assert.ok(ext?.handoff_artifacts?.code_review);
+      assert.equal(Object.prototype.hasOwnProperty.call(ext?.handoff_artifacts ?? {}, 'code-review'), false);
+      assert.equal(Object.prototype.hasOwnProperty.call(ext?.handoff_artifacts ?? {}, 'review_verdict'), false);
+    });
+
+    it('threads return-loop review cycle into the rerun ralplan stage context', async () => {
+      const plansDir = join(tempDir, '.omx', 'plans');
+      await mkdir(plansDir, { recursive: true });
+      await writeFile(join(plansDir, 'prd-stale.md'), '# Plan\n');
+      await writeFile(join(plansDir, 'test-spec-stale.md'), '# Test Spec\n');
+
+      let ralplanRuns = 0;
+      const structuralRalplan = createRalplanStage();
+      const staleRalplanArtifacts = {
+        ralplanConsensusGate: {
+          complete: true,
+          sequence: ['architect-review', 'critic-review'],
+          ralplan_architect_review: {
+            agent_role: 'architect',
+            verdict: 'approve',
+            completed_at: '2026-06-12T09:00:00.000Z',
+          },
+          ralplan_critic_review: {
+            agent_role: 'critic',
+            verdict: 'approve',
+            completed_at: '2026-06-12T09:05:00.000Z',
+          },
+        },
+      };
+
+      const ralplanStage: PipelineStage = {
+        name: 'ralplan',
+        async run(ctx: StageContext): Promise<StageResult> {
+          ralplanRuns += 1;
+          if (ralplanRuns === 1) {
+            return {
+              status: 'completed',
+              artifacts: staleRalplanArtifacts,
+              duration_ms: 0,
+            };
+          }
+          assert.equal(ctx.artifacts.current_phase, 'ralplan');
+          assert.equal(ctx.artifacts.return_to_ralplan_reason, 'Review requested a plan update.');
+          assert.equal(ctx.artifacts.review_cycle, 1);
+          return structuralRalplan.run(ctx);
+        },
+      };
+
+      const result = await runPipeline({
+        name: 'review-loop-stale-ralplan-test',
+        task: 'reject stale ralplan consensus after review loopback',
+        stages: [
+          ralplanStage,
+          makeStage('code-review', {
+            artifacts: {
+              review_verdict: {
+                recommendation: 'REQUEST CHANGES',
+                architectural_status: 'CLEAR',
+                clean: false,
+              },
+              return_to_ralplan_reason: 'Review requested a plan update.',
+            },
+          }),
+        ],
+        cwd: tempDir,
+        maxRalphIterations: 3,
+      });
+
+      assert.equal(result.status, 'failed');
+      assert.equal(result.failedStage, 'ralplan');
+      assert.equal(ralplanRuns, 2);
+      assert.equal(result.stageResults.ralplan.error, 'ralplan_consensus_evidence_missing');
+    });
+
+    it('returns to ralplan rather than deep-interview after default quality-gate failures', async () => {
+      const order: string[] = [];
+      let qaRuns = 0;
+      const stages: PipelineStage[] = [
+        makeStage('deep-interview', undefined, {
+          canSkip: () => {
+            order.push('deep-interview:skip-check');
+            return false;
+          },
+        }),
+        {
+          name: 'ralplan',
+          async run(): Promise<StageResult> {
+            order.push('ralplan');
+            return { status: 'completed', artifacts: { plan: `cycle-${order.length}` }, duration_ms: 0 };
+          },
+        },
+        makeStage('ultragoal', { artifacts: { implemented: true } }),
+        makeStage('code-review', {
+          artifacts: {
+            review_verdict: { stage: 'code-review', recommendation: 'APPROVE', architectural_status: 'CLEAR', clean: true, artifact_path: '.omx/reviews/default-quality.json' },
+            return_to_ralplan_reason: null,
+          },
+        }),
+        {
+          name: 'ultraqa',
+          async run(): Promise<StageResult> {
+            order.push('ultraqa');
+            qaRuns += 1;
+            const clean = qaRuns > 1;
+            return {
+              status: 'completed',
+              artifacts: {
+                qa_verdict: { stage: 'ultraqa', clean, skipped: false, summary: clean ? 'QA clean.' : 'QA found a regression.', url: 'https://github.com/Yeachan-Heo/oh-my-codex/actions/runs/2' },
+                return_to_ralplan_reason: clean ? null : 'QA found a regression.',
+              },
+              duration_ms: 0,
+            };
+          },
+        },
+      ];
+
+      const result = await runPipeline({
+        name: 'default-quality-loop-test',
+        task: 'loop until QA clean',
+        stages,
+        cwd: tempDir,
+        maxRalphIterations: 3,
+      });
+
+      assert.equal(result.status, 'completed');
+      assert.deepEqual(order, [
+        'deep-interview:skip-check',
+        'ralplan',
+        'ultraqa',
+        'ralplan',
+        'ultraqa',
+      ]);
+
+      const ext = await readPipelineState(tempDir);
+      assert.equal(ext?.review_cycle, 1);
+      assert.equal((ext?.qa_verdict as { clean?: boolean } | undefined)?.clean, true);
+      assert.equal(ext?.return_to_ralplan_reason, null);
+    });
+
+    it('fails after bounded non-clean code-review cycles', async () => {
+      const stages: PipelineStage[] = [
+        makeStage('ralplan'),
+        makeStage('ralph'),
+        makeStage('code-review', {
+          artifacts: {
+            review_verdict: {
+              recommendation: 'REQUEST CHANGES',
+              architectural_status: 'WATCH',
+              clean: false,
+            },
+            return_to_ralplan_reason: 'Review still has findings.',
+          },
+        }),
+      ];
+
+      const result = await runPipeline({
+        name: 'review-loop-fail-test',
+        task: 'loop until bounded failure',
+        stages,
+        cwd: tempDir,
+        maxRalphIterations: 2,
+      });
+
+      assert.equal(result.status, 'failed');
+      assert.equal(result.failedStage, 'code-review');
+      assert.match(result.error ?? '', /Autopilot quality gates were not clean after 2 cycle/);
+    });
+
+
+    it('final completion write replaces stale BLOCK verdict state with clean artifacts', async () => {
+      let reviewRuns = 0;
+      const stages: PipelineStage[] = [
+        makeStage('ralplan', { artifacts: { plan: 'approved' } }),
+        makeStage('ultragoal', { artifacts: { implemented: true } }),
+        {
+          name: 'code-review',
+          async run(): Promise<StageResult> {
+            reviewRuns += 1;
+            const clean = reviewRuns > 1;
+            return {
+              status: 'completed',
+              artifacts: {
+                review_verdict: {
+                  stage: 'code-review',
+                  recommendation: clean ? 'APPROVE' : 'REQUEST CHANGES',
+                  architectural_status: clean ? 'CLEAR' : 'BLOCK',
+                  clean,
+                  artifact_path: clean ? '.omx/reviews/final-clean.json' : '.omx/reviews/stale-block.json',
+                },
+                return_to_ralplan_reason: clean ? null : 'Stale BLOCK must be replaced after clean review.',
+              },
+              duration_ms: 0,
+            };
+          },
+        },
+        makeStage('ultraqa', {
+          artifacts: {
+            qa_verdict: {
+              stage: 'ultraqa',
+              clean: true,
+              skipped: false,
+              url: 'https://github.com/Yeachan-Heo/oh-my-codex/actions/runs/42',
+            },
+            return_to_ralplan_reason: null,
+          },
+        }),
+      ];
+
+      const result = await runPipeline({
+        name: 'stale-block-finalization',
+        task: 'finalization replaces stale blockers',
+        stages,
+        cwd: tempDir,
+      });
+
+      assert.equal(result.status, 'completed');
+      assert.equal(reviewRuns, 2);
+      const ext = await readPipelineState(tempDir);
+      const modeState = await readModeState('autopilot', tempDir);
+      assert.equal(modeState?.active, false);
+      assert.equal(modeState?.current_phase, 'complete');
+      assert.equal((ext?.review_verdict as { recommendation?: string } | undefined)?.recommendation, 'APPROVE');
+      assert.equal((ext?.review_verdict as { architectural_status?: string } | undefined)?.architectural_status, 'CLEAR');
+      assert.equal((ext?.review_verdict as { clean?: boolean } | undefined)?.clean, true);
+      assert.equal((ext?.qa_verdict as { clean?: boolean } | undefined)?.clean, true);
+      assert.equal(ext?.return_to_ralplan_reason, null);
+      assert.ok(ext?.handoff_artifacts?.code_review, 'clean code-review artifact should be preserved in terminal state');
+      assert.ok(ext?.handoff_artifacts?.ultraqa, 'clean ultraqa artifact should be preserved in terminal state');
+      assert.equal((ext?.pipeline_stage_results as Record<string, unknown> | undefined)?.['code-review'] !== undefined, true);
+      assert.equal((ext?.pipeline_stage_results as Record<string, unknown> | undefined)?.ultraqa !== undefined, true);
     });
 
     it('passes artifacts between stages', async () => {
@@ -230,6 +562,47 @@ describe('Pipeline Orchestrator', () => {
       assert.equal(result.stageResults['skippable'].status, 'skipped');
       assert.ok(!ran.includes('skippable'));
       assert.ok(ran.includes('after-skip'));
+    });
+
+    it('materializes ralplan consensus handoff artifacts when ralplan is skipped', async () => {
+      const plansDir = join(tempDir, '.omx', 'plans');
+      const stateDir = join(tempDir, '.omx', 'state');
+      await mkdir(plansDir, { recursive: true });
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(plansDir, 'prd-skip.md'), '# Plan\n');
+      await writeFile(join(plansDir, 'test-spec-skip.md'), '# Test Spec\n');
+      await writeFile(join(stateDir, 'ralplan-state.json'), JSON.stringify({
+        mode: 'ralplan',
+        current_phase: 'complete',
+        planning_complete: true,
+        ralplan_consensus_gate: {
+          complete: true,
+          ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', summary: 'architect ok' },
+          ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', summary: 'critic ok' },
+        },
+      }));
+
+      const result = await runPipeline({
+        name: 'ralplan-skip-handoff',
+        task: 'skip with durable evidence',
+        stages: [createRalplanStage(), makeStage('after')],
+        cwd: tempDir,
+      });
+
+      assert.equal(result.status, 'completed');
+      assert.equal(result.stageResults.ralplan.status, 'skipped');
+
+      const ext = await readPipelineState(tempDir);
+      const handoffs = ext?.handoff_artifacts as Record<string, unknown>;
+      assert.ok(handoffs.ralplan, 'skipped ralplan handoff should remain visible');
+      assert.deepEqual(handoffs.ralplan_consensus_gate, {
+        complete: true,
+        sequence: ['architect-review', 'critic-review'],
+        ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', summary: 'architect ok' },
+        ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', summary: 'critic ok' },
+        source: join(tempDir, '.omx', 'state', 'ralplan-state.json'),
+        blockedReason: null,
+      });
     });
 
     it('fires onStageTransition callback', async () => {
@@ -441,7 +814,7 @@ describe('Pipeline Orchestrator', () => {
           mode: 'autopilot',
           iteration: 1,
           max_iterations: 3,
-          current_phase: 'stage:team-exec',
+          current_phase: 'ralph',
           pipeline_name: 'resume-test',
           started_at: new Date().toISOString(),
         }),
@@ -473,6 +846,7 @@ describe('Pipeline Orchestrator', () => {
       assert.equal(ext.pipeline_max_ralph_iterations, 5);
       assert.equal(ext.pipeline_worker_count, 3);
       assert.equal(ext.pipeline_agent_type, 'analyst');
+      assert.equal(ext.qa_verdict, null);
     });
   });
 
@@ -484,15 +858,20 @@ describe('Pipeline Orchestrator', () => {
 
   describe('createAutopilotPipelineConfig', () => {
     it('creates config with default values', () => {
-      const stages = [makeStage('a')];
-      const config = createAutopilotPipelineConfig('build feature X', { stages });
+      const config = createAutopilotPipelineConfig('build feature X', {});
 
       assert.equal(config.name, 'autopilot');
       assert.equal(config.task, 'build feature X');
       assert.equal(config.maxRalphIterations, 10);
       assert.equal(config.workerCount, 2);
       assert.equal(config.agentType, 'executor');
-      assert.equal(config.stages.length, 1);
+      assert.deepEqual(config.stages.map((stage) => stage.name), ['deep-interview', 'ralplan', 'ultragoal', 'code-review', 'ultraqa']);
+    });
+
+
+
+    it('exposes strict default autopilot stages', () => {
+      assert.deepEqual(createStrictAutopilotStages().map((stage) => stage.name), ['deep-interview', 'ralplan', 'ultragoal', 'code-review', 'ultraqa']);
     });
 
     it('accepts custom overrides', () => {

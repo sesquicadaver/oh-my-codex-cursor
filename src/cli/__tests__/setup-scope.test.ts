@@ -23,16 +23,23 @@ function runOmx(
   const repoRoot = join(testDir, "..", "..", "..");
   const omxBin = join(repoRoot, "dist", "cli", "omx.js");
   const resolvedHome = envOverrides.HOME ?? process.env.HOME;
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...(resolvedHome && !envOverrides.CODEX_HOME
+      ? { CODEX_HOME: join(resolvedHome, ".codex") }
+      : {}),
+    ...envOverrides,
+  };
+  delete env.OMX_SESSION_ID;
+  delete env.OMX_RUN_ID;
+  delete env.OMX_ROOT;
+  delete env.OMX_STATE_ROOT;
+  delete env.OMX_ACTIVE_SESSION_PID;
+  delete env.TMUX_PANE;
   const result = spawnSync(process.execPath, [omxBin, ...argv], {
     cwd,
     encoding: "utf-8",
-    env: {
-      ...process.env,
-      ...(resolvedHome && !envOverrides.CODEX_HOME
-        ? { CODEX_HOME: join(resolvedHome, ".codex") }
-        : {}),
-      ...envOverrides,
-    },
+    env,
   });
   return {
     status: result.status,
@@ -45,6 +52,13 @@ function runOmx(
 function shouldSkipForSpawnPermissions(err: string): boolean {
   return typeof err === "string" && /(EPERM|EACCES)/i.test(err);
 }
+
+const MINIMAL_OMX_AGENTS_CONTRACT = [
+  "<!-- omx:generated:agents-md -->",
+  "# oh-my-codex - Intelligent Multi-Agent Orchestration",
+  "AGENTS.md is the top-level operating contract for the workspace.",
+  "",
+].join("\n");
 
 describe("omx setup scope behavior", () => {
   it("accepts --scope project form", async () => {
@@ -180,6 +194,7 @@ describe("omx setup scope behavior", () => {
       const localPrompts = join(wd, ".codex", "prompts");
       const localSkills = join(wd, ".codex", "skills");
       const localConfig = join(wd, ".codex", "config.toml");
+      const localHooks = join(wd, ".codex", "hooks.json");
       const localAgents = join(wd, ".codex", "agents");
       const scopeFile = join(wd, ".omx", "setup-scope.json");
       const agentsMdPath = join(wd, "AGENTS.md");
@@ -187,6 +202,7 @@ describe("omx setup scope behavior", () => {
       assert.equal(existsSync(localPrompts), true);
       assert.equal(existsSync(localSkills), true);
       assert.equal(existsSync(localConfig), true);
+      assert.equal(existsSync(localHooks), true);
       assert.equal(existsSync(localAgents), true);
       assert.equal(existsSync(join(localAgents, "executor.toml")), true);
       assert.equal(
@@ -194,12 +210,16 @@ describe("omx setup scope behavior", () => {
         true,
       );
       assert.equal(
-        existsSync(join(localSkills, "ask-claude", "SKILL.md")),
+        existsSync(join(localSkills, "ask", "SKILL.md")),
         true,
       );
       assert.equal(
+        existsSync(join(localSkills, "ask-claude", "SKILL.md")),
+        false,
+      );
+      assert.equal(
         existsSync(join(localSkills, "ask-gemini", "SKILL.md")),
-        true,
+        false,
       );
       assert.ok(
         (await readdir(localPrompts)).length > 0,
@@ -211,15 +231,187 @@ describe("omx setup scope behavior", () => {
       assert.match(configToml, /^\[agents\]$/m);
       assert.match(configToml, /^max_threads = 6$/m);
       assert.match(configToml, /^max_depth = 2$/m);
-      assert.match(configToml, /^\[env\]$/m);
-      assert.match(configToml, /^USE_OMX_EXPLORE_CMD = "1"$/m);
+      assert.doesNotMatch(configToml, /^\[env\]$/m);
+      assert.match(configToml, /^\[shell_environment_policy\.set\]$/m);
+      assert.match(configToml, /^USE_OMX_EXPLORE_CMD = "0"$/m);
+      assert.match(configToml, /^hooks = true$/m);
+      assert.match(configToml, /^goals = true$/m);
+      assert.match(
+        configToml,
+        /^\[hooks\.state\.".*\/\.codex\/hooks\.json:session_start:0:0"\]$/m,
+      );
+      assert.match(configToml, /^trusted_hash = "sha256:[a-f0-9]{64}"$/m);
+      const hooksJson = JSON.parse(await readFile(localHooks, "utf-8")) as {
+        hooks?: Record<string, unknown>;
+      };
+      assert.ok(hooksJson.hooks, "hooks.json should include a hooks object");
+      assert.ok(hooksJson.hooks?.SessionStart, "hooks.json should register SessionStart");
+      assert.ok(hooksJson.hooks?.UserPromptSubmit, "hooks.json should register UserPromptSubmit");
+      assert.ok(hooksJson.hooks?.Stop, "hooks.json should register Stop");
       const agentsMd = await readFile(agentsMdPath, "utf-8");
-      assert.match(agentsMd, /\.\/\.codex\/prompts/);
+      assert.match(agentsMd, /prompts\/\*\.md/);
       assert.match(agentsMd, /\.\/\.codex\/skills/);
       const persistedScope = JSON.parse(await readFile(scopeFile, "utf-8")) as {
         scope: string;
       };
       assert.equal(persistedScope.scope, "project");
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("setup preserves user hooks while replacing stale OMX wrappers", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-setup-scope-"));
+    try {
+      const home = join(wd, "home");
+      const codexDir = join(wd, ".codex");
+      await mkdir(home, { recursive: true });
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(
+        join(codexDir, "hooks.json"),
+        JSON.stringify(
+          {
+            hooks: {
+              SessionStart: [
+                {
+                  hooks: [
+                    {
+                      type: "command",
+                      command: 'node "/old/dist/scripts/codex-native-hook.js"',
+                    },
+                    { type: "command", command: "echo keep-me" },
+                  ],
+                },
+              ],
+              Stop: [
+                {
+                  hooks: [
+                    {
+                      type: "command",
+                      command: 'node "/old/dist/scripts/codex-native-hook.js"',
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      await writeFile(
+        join(codexDir, "config.toml"),
+        [
+          "[hooks.state.\"custom:/hooks.json:stop:0:0\"]",
+          "trusted_hash = \"sha256:user\"",
+          "enabled = false",
+          "",
+        ].join("\n"),
+      );
+
+      const res = runOmx(wd, ["setup", "--scope", "project"], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+
+      const hooksJson = JSON.parse(
+        await readFile(join(codexDir, "hooks.json"), "utf-8"),
+      ) as {
+        hooks: Record<string, Array<{ hooks?: Array<{ command?: string }> }>>;
+      };
+      const sessionStartHooks = hooksJson.hooks.SessionStart.flatMap((entry) =>
+        entry.hooks ?? []
+      );
+      const stopHooks = hooksJson.hooks.Stop.flatMap((entry) => entry.hooks ?? []);
+
+      assert.equal(
+        sessionStartHooks.filter((hook) =>
+          String(hook.command ?? "").includes("codex-native-hook.js")
+        ).length,
+        1,
+      );
+      assert.equal(
+        stopHooks.filter((hook) =>
+          String(hook.command ?? "").includes("codex-native-hook.js")
+        ).length,
+        1,
+      );
+      assert.match(JSON.stringify(sessionStartHooks), /echo keep-me/);
+      assert.doesNotMatch(
+        JSON.stringify(hooksJson),
+        /\/old\/dist\/scripts\/codex-native-hook\.js/,
+      );
+      const configToml = await readFile(join(codexDir, "config.toml"), "utf-8");
+      assert.match(
+        configToml,
+        /^\[hooks\.state\."custom:\/hooks\.json:stop:0:0"\]$/m,
+      );
+      assert.match(configToml, /^enabled = false$/m);
+      assert.match(
+        configToml,
+        /^\[hooks\.state\.".*\/\.codex\/hooks\.json:stop:0:0"\]$/m,
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates legacy hooks.json state to config.toml and removes Codex-incompatible top-level state", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-setup-hooks-state-migration-"));
+    try {
+      const home = join(wd, "home");
+      const codexDir = join(wd, ".codex");
+      await mkdir(home, { recursive: true });
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(
+        join(codexDir, "hooks.json"),
+        JSON.stringify(
+          {
+            state: {
+              "custom:/hooks.json:stop:0:0": {
+                trusted_hash: "sha256:user",
+                enabled: false,
+              },
+            },
+            hooks: {
+              Stop: [
+                {
+                  hooks: [
+                    {
+                      type: "command",
+                      command: 'node "/old/dist/scripts/codex-native-hook.js"',
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      await writeFile(join(codexDir, "config.toml"), "omx_enabled = true\n");
+
+      const res = runOmx(wd, ["setup", "--scope", "project"], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+
+      const hooksJson = JSON.parse(
+        await readFile(join(codexDir, "hooks.json"), "utf-8"),
+      ) as {
+        state?: unknown;
+        hooks?: Record<string, unknown>;
+      };
+      assert.equal(Object.hasOwn(hooksJson, "state"), false);
+      assert.equal(Object.hasOwn(hooksJson.hooks ?? {}, "state"), false);
+      assert.ok(hooksJson.hooks?.Stop, "managed setup should preserve Stop coverage");
+
+      const configToml = await readFile(join(codexDir, "config.toml"), "utf-8");
+      assert.match(
+        configToml,
+        /^\[hooks\.state\."custom:\/hooks\.json:stop:0:0"\]$/m,
+      );
+      assert.match(configToml, /^trusted_hash = "sha256:user"$/m);
+      assert.match(configToml, /^enabled = false$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -244,6 +436,7 @@ describe("omx setup scope behavior", () => {
       assert.equal(existsSync(join(home, ".codex", "prompts")), true);
       assert.equal(existsSync(join(home, ".codex", "skills")), true);
       assert.equal(existsSync(join(home, ".codex", "agents")), true);
+      assert.equal(existsSync(join(home, ".codex", "hooks.json")), true);
       assert.equal(existsSync(join(home, ".codex", "AGENTS.md")), true);
       assert.equal(existsSync(join(wd, ".omx", "setup-scope.json")), true);
       const persistedScope = JSON.parse(
@@ -278,7 +471,10 @@ describe("omx setup scope behavior", () => {
         join(wd, ".omx", "setup-scope.json"),
         JSON.stringify({ scope: "user" }),
       );
-      await writeFile(join(home, ".codex", "AGENTS.md"), "# user agents\n");
+      await writeFile(
+        join(home, ".codex", "AGENTS.md"),
+        MINIMAL_OMX_AGENTS_CONTRACT,
+      );
       await writeFile(
         join(home, ".codex", "prompts", "executor.md"),
         "# executor\n",
@@ -304,7 +500,7 @@ describe("omx setup scope behavior", () => {
       );
       assert.match(
         res.stdout,
-        /\[OK\] AGENTS\.md: found in .*home\/\.codex\/AGENTS\.md/,
+        /\[OK\] AGENTS\.md: found OMX contract in .*home\/\.codex\/AGENTS\.md/,
       );
     } finally {
       await rm(wd, { recursive: true, force: true });

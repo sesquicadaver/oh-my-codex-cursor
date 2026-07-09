@@ -1,14 +1,16 @@
 import { AGENT_DEFINITIONS, type AgentDefinition } from '../agents/definitions.js';
+import { isNativeAgentInstallableStatus } from '../agents/policy.js';
+import { tryReadCatalogManifest } from '../catalog/reader.js';
 import { getRootModelName } from '../config/generator.js';
 import {
   DEFAULT_FRONTIER_MODEL,
-  DEFAULT_STANDARD_MODEL,
   DEFAULT_SPARK_MODEL,
+  getAgentModelOverride,
+  getAgentReasoningOverride,
   getEnvConfiguredSparkDefaultModel,
   getEnvConfiguredMainDefaultModel,
   getEnvConfiguredStandardDefaultModel,
   getSparkDefaultModel,
-  getStandardDefaultModel,
 } from '../config/models.js';
 
 export const OMX_MODELS_START_MARKER = '<!-- OMX:MODELS:START -->';
@@ -22,6 +24,10 @@ export interface AgentsModelTableContext {
   subagentDefaultModel: string;
 }
 
+interface AgentsModelTableOptions {
+  codexHomeOverride?: string;
+}
+
 function escapeTableCell(value: string): string {
   return value.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
 }
@@ -33,7 +39,16 @@ function formatRoleLabel(role: string): string {
 function getAgentRecommendedModel(
   agent: AgentDefinition,
   context: AgentsModelTableContext,
+  options: AgentsModelTableOptions = {},
 ): string {
+  const modelOverride = getAgentModelOverride(agent.name, options.codexHomeOverride);
+  if (modelOverride) {
+    return modelOverride;
+  }
+  if (agent.exactModel) {
+    return agent.exactModel;
+  }
+
   if (agent.name === 'executor') {
     return context.frontierModel;
   }
@@ -49,6 +64,14 @@ function getAgentRecommendedModel(
   }
 }
 
+function getAgentReasoningEffort(
+  agent: AgentDefinition,
+  options: AgentsModelTableOptions = {},
+): string {
+  return getAgentReasoningOverride(agent.name, options.codexHomeOverride)
+    ?? agent.reasoningEffort;
+}
+
 function getAgentUseCase(agent: AgentDefinition): string {
   return `${agent.description} (${agent.posture}, ${agent.modelClass})`;
 }
@@ -60,6 +83,23 @@ function buildTableRow(
   useCase: string,
 ): string {
   return `| ${escapeTableCell(formatRoleLabel(role))} | ${escapeTableCell(`\`${model}\``)} | ${escapeTableCell(reasoningEffort)} | ${escapeTableCell(useCase)} |`;
+}
+
+function getModelTableAgents(
+  definitions: Record<string, AgentDefinition>,
+): AgentDefinition[] {
+  const manifest = tryReadCatalogManifest();
+  if (!manifest) return Object.values(definitions);
+
+  const installableAgentNames = new Set(
+    manifest.agents
+      .filter((agent) => isNativeAgentInstallableStatus(agent.status))
+      .map((agent) => agent.name),
+  );
+
+  return Object.values(definitions).filter((agent) =>
+    installableAgentNames.has(agent.name),
+  );
 }
 
 export function resolveAgentsModelTableContext(
@@ -80,8 +120,7 @@ export function resolveAgentsModelTableContext(
     DEFAULT_SPARK_MODEL;
   const subagentDefaultModel =
     getEnvConfiguredStandardDefaultModel(env, codexHomeOverride) ??
-    getStandardDefaultModel(codexHomeOverride) ??
-    DEFAULT_STANDARD_MODEL;
+    frontierModel;
 
   return {
     frontierModel,
@@ -93,6 +132,7 @@ export function resolveAgentsModelTableContext(
 export function buildAgentsModelTable(
   context: AgentsModelTableContext,
   definitions: Record<string, AgentDefinition> = AGENT_DEFINITIONS,
+  options: AgentsModelTableOptions = {},
 ): string {
   const rows = [
     buildTableRow(
@@ -113,11 +153,11 @@ export function buildAgentsModelTable(
       'high',
       'Default standard-capability model for installable specialists and secondary worker lanes unless a role is explicitly frontier or spark.',
     ),
-    ...Object.values(definitions).map((agent) =>
+    ...getModelTableAgents(definitions).map((agent) =>
       buildTableRow(
         agent.name,
-        getAgentRecommendedModel(agent, context),
-        agent.reasoningEffort,
+        getAgentRecommendedModel(agent, context, options),
+        getAgentReasoningEffort(agent, options),
         getAgentUseCase(agent),
       ),
     ),
@@ -137,10 +177,11 @@ export function buildAgentsModelTable(
 export function renderAgentsModelTableBlock(
   context: AgentsModelTableContext,
   definitions: Record<string, AgentDefinition> = AGENT_DEFINITIONS,
+  options: AgentsModelTableOptions = {},
 ): string {
   return [
     OMX_MODELS_START_MARKER,
-    buildAgentsModelTable(context, definitions),
+    buildAgentsModelTable(context, definitions, options),
     OMX_MODELS_END_MARKER,
   ].join('\n');
 }
@@ -149,8 +190,9 @@ export function upsertAgentsModelTable(
   content: string,
   context: AgentsModelTableContext,
   definitions: Record<string, AgentDefinition> = AGENT_DEFINITIONS,
+  options: AgentsModelTableOptions = {},
 ): string {
-  const block = renderAgentsModelTableBlock(context, definitions);
+  const block = renderAgentsModelTableBlock(context, definitions, options);
   const startIndex = content.indexOf(OMX_MODELS_START_MARKER);
   const endIndex = content.indexOf(OMX_MODELS_END_MARKER);
 

@@ -1,11 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { buildManagedCodexHooksConfig } from '../../config/codex-hooks.js';
 
 function runOmx(
   cwd: string,
@@ -42,12 +43,14 @@ function buildOmxConfig(): string {
   return [
     '# oh-my-codex top-level settings (must be before any [table])',
     'notify = ["node", "/path/to/notify-hook.js"]',
-    'model_reasoning_effort = "high"',
+    'model_reasoning_effort = "medium"',
     'developer_instructions = "You have oh-my-codex installed."',
     '',
     '[features]',
     'multi_agent = true',
     'child_agents_md = true',
+    'hooks = true',
+    'goals = true',
     '',
     '# ============================================================',
     '# oh-my-codex (OMX) Configuration',
@@ -82,6 +85,13 @@ function buildOmxConfig(): string {
     'enabled = true',
     'startup_timeout_sec = 5',
     '',
+    '# OMX Wiki MCP Server',
+    '[mcp_servers.omx_wiki]',
+    'command = "node"',
+    'args = ["/path/to/wiki-server.js"]',
+    'enabled = true',
+    'startup_timeout_sec = 5',
+    '',
     '[agents.executor]',
     'description = "Code implementation"',
     'config_file = "/path/to/executor.toml"',
@@ -102,15 +112,53 @@ function buildConfigWithSeededModelContext(): string {
   return [
     '# oh-my-codex top-level settings (must be before any [table])',
     'notify = ["node", "/path/to/notify-hook.js"]',
-    'model_reasoning_effort = "high"',
+    'model_reasoning_effort = "medium"',
     'developer_instructions = "You have oh-my-codex installed."',
-    'model = "gpt-5.4"',
-    'model_context_window = 1000000',
-    'model_auto_compact_token_limit = 900000',
+    'model = "gpt-5.5"',
+    '# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)',
+    'model_context_window = 250000',
+    'model_auto_compact_token_limit = 200000',
+    '# End oh-my-codex seeded behavioral defaults',
     '',
     '[features]',
     'multi_agent = true',
     'child_agents_md = true',
+    'hooks = true',
+    'goals = true',
+    '',
+    '# ============================================================',
+    '# oh-my-codex (OMX) Configuration',
+    '# Managed by omx setup - manual edits preserved on next setup',
+    '# ============================================================',
+    '',
+    '[mcp_servers.omx_state]',
+    'command = "node"',
+    'args = ["/path/to/state-server.js"]',
+    'enabled = true',
+    '',
+    '# ============================================================',
+    '# End oh-my-codex',
+    '',
+  ].join('\n');
+}
+
+function buildConfigWithEditedSeededModelContext(): string {
+  return [
+    '# oh-my-codex top-level settings (must be before any [table])',
+    'notify = ["node", "/path/to/notify-hook.js"]',
+    'model_reasoning_effort = "medium"',
+    'developer_instructions = "You have oh-my-codex installed."',
+    'model = "gpt-5.5"',
+    '# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)',
+    'model_context_window = 123456',
+    'model_auto_compact_token_limit = 200000',
+    '# End oh-my-codex seeded behavioral defaults',
+    '',
+    '[features]',
+    'multi_agent = true',
+    'child_agents_md = true',
+    'hooks = true',
+    'goals = true',
     '',
     '# ============================================================',
     '# oh-my-codex (OMX) Configuration',
@@ -135,12 +183,14 @@ function buildMixedConfig(): string {
     '',
     '# oh-my-codex top-level settings (must be before any [table])',
     'notify = ["node", "/path/to/notify-hook.js"]',
-    'model_reasoning_effort = "high"',
+    'model_reasoning_effort = "medium"',
     'developer_instructions = "You have oh-my-codex installed."',
     '',
     '[features]',
     'multi_agent = true',
     'child_agents_md = true',
+    'hooks = true',
+    'goals = true',
     'web_search = true',
     '',
     '[mcp_servers.user_custom]',
@@ -172,6 +222,11 @@ function buildMixedConfig(): string {
     'args = ["/path/to/trace-server.js"]',
     'enabled = true',
     '',
+    '[mcp_servers.omx_wiki]',
+    'command = "node"',
+    'args = ["/path/to/wiki-server.js"]',
+    'enabled = true',
+    '',
     '[agents.executor]',
     'description = "Code implementation"',
     'config_file = "/path/to/executor.toml"',
@@ -193,17 +248,23 @@ describe('omx uninstall', () => {
       const codexDir = join(home, '.codex');
       await mkdir(codexDir, { recursive: true });
       await writeFile(join(codexDir, 'config.toml'), buildOmxConfig());
+      await writeFile(
+        join(codexDir, 'hooks.json'),
+        JSON.stringify(buildManagedCodexHooksConfig(wd), null, 2) + '\n',
+      );
 
       const res = runOmx(wd, ['uninstall', '--dry-run'], { HOME: home });
       if (shouldSkipForSpawnPermissions(res.error)) return;
       assert.equal(res.status, 0, res.stderr || res.stdout);
       assert.match(res.stdout, /dry-run mode/);
       assert.match(res.stdout, /OMX configuration block/);
+      assert.match(res.stdout, /hooks\.json/);
       assert.match(res.stdout, /omx_state/);
 
       // Config should NOT have been modified
       const config = await readFile(join(codexDir, 'config.toml'), 'utf-8');
       assert.match(config, /oh-my-codex \(OMX\) Configuration/);
+      assert.equal(existsSync(join(codexDir, 'hooks.json')), true);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -216,6 +277,10 @@ describe('omx uninstall', () => {
       const codexDir = join(home, '.codex');
       await mkdir(codexDir, { recursive: true });
       await writeFile(join(codexDir, 'config.toml'), buildOmxConfig());
+      await writeFile(
+        join(codexDir, 'hooks.json'),
+        JSON.stringify(buildManagedCodexHooksConfig(wd), null, 2) + '\n',
+      );
 
       const res = runOmx(wd, ['uninstall'], { HOME: home });
       if (shouldSkipForSpawnPermissions(res.error)) return;
@@ -228,6 +293,7 @@ describe('omx uninstall', () => {
       assert.doesNotMatch(config, /omx_memory/);
       assert.doesNotMatch(config, /omx_code_intel/);
       assert.doesNotMatch(config, /omx_trace/);
+      assert.doesNotMatch(config, /omx_wiki/);
       assert.doesNotMatch(config, /\[agents\.executor\]/);
       assert.doesNotMatch(config, /\[tui\]/);
       assert.doesNotMatch(config, /notify\s*=/);
@@ -235,11 +301,65 @@ describe('omx uninstall', () => {
       assert.doesNotMatch(config, /developer_instructions\s*=/);
       assert.doesNotMatch(config, /multi_agent\s*=/);
       assert.doesNotMatch(config, /child_agents_md\s*=/);
+      assert.doesNotMatch(config, /^hooks\s*=/m);
+      assert.equal(existsSync(join(codexDir, 'hooks.json')), false);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
+
+  it('does not restore stale OMX dispatcher metadata as notify', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-stale-notify-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      const metadataPath = join(codexDir, '.omx', 'notify-dispatch.json');
+      const stalePkgRoot = join(wd, 'old-global', 'oh-my-codex');
+      const staleDispatcher = join(stalePkgRoot, 'dist', 'scripts', 'notify-dispatcher.js');
+      await mkdir(dirname(metadataPath), { recursive: true });
+      await writeFile(
+        join(codexDir, 'config.toml'),
+        [
+          '# User settings',
+          'approval_policy = "on-failure"',
+          `notify = ["node", "${staleDispatcher}", "--metadata", "${metadataPath}"]`,
+          '',
+          '# ============================================================',
+          '# oh-my-codex (OMX) Configuration',
+          '# Managed by omx setup - manual edits preserved on next setup',
+          '# ============================================================',
+          '[mcp_servers.omx_state]',
+          'command = "node"',
+          'args = ["/path/to/state-server.js"]',
+          'enabled = true',
+          '# ============================================================',
+          '# End oh-my-codex',
+          '',
+        ].join('\n'),
+      );
+      await writeFile(
+        metadataPath,
+        JSON.stringify({
+          managedBy: 'oh-my-codex',
+          version: 1,
+          previousNotify: ['node', staleDispatcher, '--metadata', metadataPath],
+        }),
+      );
+
+      const res = runOmx(wd, ['uninstall'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+
+      const config = await readFile(join(codexDir, 'config.toml'), 'utf-8');
+      assert.match(config, /^approval_policy = "on-failure"$/m);
+      assert.doesNotMatch(config, /^notify\s*=/m);
+      assert.doesNotMatch(config, /notify-dispatcher\.js/);
+      assert.doesNotMatch(config, /oh-my-codex \(OMX\) Configuration/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
 
   it('preserves user config entries when removing OMX', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
@@ -264,13 +384,113 @@ describe('omx uninstall', () => {
       assert.doesNotMatch(config, /notify\s*=.*node/);
       assert.doesNotMatch(config, /multi_agent/);
       assert.doesNotMatch(config, /child_agents_md/);
+      assert.doesNotMatch(config, /^hooks\s*=/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
+  it('preserves user hooks while removing OMX-managed wrappers', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(
+        join(codexDir, 'config.toml'),
+        buildOmxConfig().replace(/^hooks = true$/m, 'codex_hooks = true'),
+      );
+      await writeFile(
+        join(codexDir, 'hooks.json'),
+        JSON.stringify(
+          {
+            hooks: {
+              SessionStart: [
+                {
+                  hooks: [
+                    { type: 'command', command: 'node "/repo/dist/scripts/codex-native-hook.js"' },
+                    { type: 'command', command: 'echo keep-me' },
+                  ],
+                },
+              ],
+            },
+            version: 1,
+          },
+          null,
+          2,
+        ) + '\n',
+      );
 
-  it('preserves seeded model/context keys during uninstall', async () => {
+      const res = runOmx(wd, ['uninstall'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+      assert.equal(existsSync(join(codexDir, 'hooks.json')), true);
+
+      const hooks = await readFile(join(codexDir, 'hooks.json'), 'utf-8');
+      assert.match(hooks, /echo keep-me/);
+      assert.match(hooks, /"version": 1/);
+      assert.doesNotMatch(hooks, /codex-native-hook\.js/);
+
+      const config = await readFile(join(codexDir, 'config.toml'), 'utf-8');
+      assert.match(
+        config,
+        /^hooks = true$/m,
+        'preserved user hooks should keep the canonical Codex hooks feature enabled',
+      );
+      assert.doesNotMatch(
+        config,
+        /^codex_hooks\s*=/m,
+        'legacy Codex hook aliases should be normalized during uninstall preservation',
+      );
+      assert.doesNotMatch(config, /^multi_agent\s*=/m);
+      assert.doesNotMatch(config, /^child_agents_md\s*=/m);
+      assert.doesNotMatch(config, /^goals\s*=/m);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not preserve hooks feature flag from non-features tables', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(
+        join(codexDir, 'config.toml'),
+        `${buildOmxConfig().replace('hooks = true\n', '')}\n[user.settings]\nhooks = true\n`,
+      );
+      await writeFile(
+        join(codexDir, 'hooks.json'),
+        JSON.stringify({
+          hooks: {
+            SessionStart: [
+              {
+                hooks: [
+                  { type: 'command', command: 'node "/repo/dist/scripts/codex-native-hook.js"' },
+                  { type: 'command', command: 'echo keep-me' },
+                ],
+              },
+            ],
+          },
+        }) + '\n',
+      );
+
+      const res = runOmx(wd, ['uninstall'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+
+      const config = await readFile(join(codexDir, 'config.toml'), 'utf-8');
+      const featuresBlock = config.match(/^\[features\]\n(?:(?!^\[).*\n?)*/m)?.[0] ?? '';
+      assert.doesNotMatch(featuresBlock, /^hooks = true$/m);
+      assert.doesNotMatch(featuresBlock, /^codex_hooks = true$/m);
+      assert.match(config, /^\[user\.settings\]\nhooks = true$/m);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('removes unchanged OMX-seeded model/context keys during uninstall', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
     try {
       const home = join(wd, 'home');
@@ -283,9 +503,36 @@ describe('omx uninstall', () => {
       assert.equal(res.status, 0, res.stderr || res.stdout);
 
       const config = await readFile(join(codexDir, 'config.toml'), 'utf-8');
-      assert.match(config, /^model = "gpt-5\.4"$/m);
-      assert.match(config, /^model_context_window = 1000000$/m);
-      assert.match(config, /^model_auto_compact_token_limit = 900000$/m);
+      assert.match(config, /^model = "gpt-5\.5"$/m);
+      assert.doesNotMatch(config, /^model_context_window = 250000$/m);
+      assert.doesNotMatch(config, /^model_auto_compact_token_limit = 200000$/m);
+      assert.doesNotMatch(config, /seeded behavioral defaults/);
+      assert.doesNotMatch(config, /notify\s*=/);
+      assert.doesNotMatch(config, /model_reasoning_effort\s*=/);
+      assert.doesNotMatch(config, /developer_instructions\s*=/);
+      assert.doesNotMatch(config, /oh-my-codex \(OMX\) Configuration/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves user-edited seeded model/context keys during uninstall', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(join(codexDir, 'config.toml'), buildConfigWithEditedSeededModelContext());
+
+      const res = runOmx(wd, ['uninstall'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+
+      const config = await readFile(join(codexDir, 'config.toml'), 'utf-8');
+      assert.match(config, /^model = "gpt-5\.5"$/m);
+      assert.match(config, /^model_context_window = 123456$/m);
+      assert.match(config, /^model_auto_compact_token_limit = 200000$/m);
+      assert.doesNotMatch(config, /seeded behavioral defaults/);
       assert.doesNotMatch(config, /notify\s*=/);
       assert.doesNotMatch(config, /model_reasoning_effort\s*=/);
       assert.doesNotMatch(config, /developer_instructions\s*=/);
@@ -396,11 +643,133 @@ describe('omx uninstall', () => {
       if (shouldSkipForSpawnPermissions(res.error)) return;
       assert.equal(res.status, 0, res.stderr || res.stdout);
       assert.match(res.stdout, /Uninstall summary/);
-      assert.match(res.stdout, /MCP servers: omx_state, omx_memory, omx_code_intel, omx_trace/);
+      assert.match(res.stdout, /MCP servers: omx_state, omx_memory, omx_code_intel, omx_trace, omx_wiki/);
       assert.match(res.stdout, /Agent entries: 1/);
       assert.match(res.stdout, /TUI status line section/);
       assert.match(res.stdout, /Top-level keys/);
       assert.match(res.stdout, /Feature flags/);
+      assert.match(res.stdout, /goal/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('warns when overlapping legacy ~/.agents/skills remains after user-scope uninstall', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      const canonicalHelp = join(codexDir, 'skills', 'help');
+      const legacyHelp = join(home, '.agents', 'skills', 'help');
+      await mkdir(canonicalHelp, { recursive: true });
+      await mkdir(legacyHelp, { recursive: true });
+      await writeFile(join(canonicalHelp, 'SKILL.md'), '# canonical help\n');
+      await writeFile(join(legacyHelp, 'SKILL.md'), '# legacy help\n');
+
+      const res = runOmx(wd, ['uninstall', '--keep-config'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+      assert.match(
+        res.stdout,
+        /Warning: 1 overlapping skill names remain between .*\.codex[\\/]+skills and .*\.agents[\\/]+skills; 1 differ in SKILL\.md content\. omx uninstall only removes the active canonical skill root; archive or remove ~\/\.agents\/skills if Codex still shows duplicates/,
+      );
+      assert.equal(existsSync(canonicalHelp), false, 'canonical OMX skill should be removed');
+      assert.equal(existsSync(join(home, '.agents', 'skills')), true, 'legacy skill root should remain for manual cleanup');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('warns when a distinct legacy ~/.agents/skills root remains after user-scope uninstall', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      const canonicalHelp = join(codexDir, 'skills', 'help');
+      const legacyDoctor = join(home, '.agents', 'skills', 'doctor');
+      await mkdir(canonicalHelp, { recursive: true });
+      await mkdir(legacyDoctor, { recursive: true });
+      await writeFile(join(canonicalHelp, 'SKILL.md'), '# canonical help\n');
+      await writeFile(join(legacyDoctor, 'SKILL.md'), '# legacy doctor\n');
+
+      const res = runOmx(wd, ['uninstall', '--keep-config'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+      assert.match(
+        res.stdout,
+        /Warning: legacy ~\/\.agents\/skills still exists \(1 skills\)\. omx uninstall does not remove that historical root automatically; archive or remove ~\/\.agents\/skills if Codex still shows stale or duplicate skills/,
+      );
+      assert.equal(existsSync(canonicalHelp), false, 'canonical OMX skill should be removed');
+      assert.equal(existsSync(join(home, '.agents', 'skills')), true, 'legacy skill root should remain for manual cleanup');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not warn about legacy ~/.agents/skills when none exists', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      const canonicalHelp = join(codexDir, 'skills', 'help');
+      await mkdir(canonicalHelp, { recursive: true });
+      await writeFile(join(canonicalHelp, 'SKILL.md'), '# canonical help\n');
+
+      const res = runOmx(wd, ['uninstall', '--keep-config'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+      assert.doesNotMatch(res.stdout, /legacy ~\/\.agents\/skills still exists/);
+      assert.doesNotMatch(res.stdout, /omx uninstall does not remove legacy ~\/\.agents\/skills/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not warn about legacy ~/.agents/skills during project-scope uninstall', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
+    try {
+      const home = join(wd, 'home');
+      const projectSkillsHelp = join(wd, '.codex', 'skills', 'help');
+      const legacyHelp = join(home, '.agents', 'skills', 'help');
+      await mkdir(projectSkillsHelp, { recursive: true });
+      await mkdir(legacyHelp, { recursive: true });
+      await mkdir(join(wd, '.omx'), { recursive: true });
+      await writeFile(join(projectSkillsHelp, 'SKILL.md'), '# project help\n');
+      await writeFile(join(legacyHelp, 'SKILL.md'), '# legacy help\n');
+      await writeFile(join(wd, '.omx', 'setup-scope.json'), JSON.stringify({ scope: 'project' }));
+
+      const res = runOmx(wd, ['uninstall', '--keep-config'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+      assert.match(res.stdout, /Resolved scope: project/);
+      assert.doesNotMatch(res.stdout, /legacy ~\/\.agents\/skills still exists/);
+      assert.doesNotMatch(res.stdout, /omx uninstall does not remove legacy ~\/\.agents\/skills/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not warn when legacy ~/.agents/skills is just a link to the canonical skills root', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-legacy-link-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      const canonicalSkillsRoot = join(codexDir, 'skills');
+      const canonicalSkill = join(canonicalSkillsRoot, 'doctor');
+      const legacyRoot = join(home, '.agents', 'skills');
+      await mkdir(canonicalSkill, { recursive: true });
+      await mkdir(join(home, '.agents'), { recursive: true });
+      await writeFile(join(canonicalSkill, 'SKILL.md'), '# canonical doctor\n');
+      await symlink(
+        canonicalSkillsRoot,
+        legacyRoot,
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+
+      const res = runOmx(wd, ['uninstall', '--keep-config'], { HOME: home, CODEX_HOME: codexDir });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+      assert.doesNotMatch(res.stdout, /legacy ~\/\.agents\/skills/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -534,6 +903,10 @@ describe('stripOmxFeatureFlags', () => {
       '[features]',
       'multi_agent = true',
       'child_agents_md = true',
+      'hooks = true',
+      'codex_hooks = true',
+      'goals = true',
+      'goal = true',
       'web_search = true',
       '',
     ].join('\n');
@@ -541,6 +914,10 @@ describe('stripOmxFeatureFlags', () => {
     const result = stripOmxFeatureFlags(config);
     assert.doesNotMatch(result, /multi_agent/);
     assert.doesNotMatch(result, /child_agents_md/);
+    assert.doesNotMatch(result, /^hooks\s*=/m);
+    assert.doesNotMatch(result, /^codex_hooks\s*=/m);
+    assert.doesNotMatch(result, /^goals\s*=/m);
+    assert.doesNotMatch(result, /^goal\s*=/m);
     assert.match(result, /web_search = true/);
     assert.match(result, /\[features\]/);
   });
@@ -552,12 +929,14 @@ describe('stripOmxFeatureFlags', () => {
       '[features]',
       'multi_agent = true',
       'child_agents_md = true',
+      'goals = true',
       '',
     ].join('\n');
 
     const result = stripOmxFeatureFlags(config);
     assert.doesNotMatch(result, /\[features\]/);
     assert.doesNotMatch(result, /multi_agent/);
+    assert.doesNotMatch(result, /^goals\s*=/m);
   });
 
   it('handles config without [features] section', async () => {

@@ -22,6 +22,7 @@ import {
   listInstalledSkillDirectories,
   omxNotepadPath,
   omxProjectMemoryPath,
+  omxStateDir,
   packageRoot,
 } from "../utils/paths.js";
 import {
@@ -29,13 +30,22 @@ import {
   readPlanningArtifacts,
 } from "../planning/artifacts.js";
 import {
-  getReadScopedStateDirs,
+  getAuthoritativeActiveStateDirs,
+  getAuthoritativeActiveStatePaths,
   getStateDir,
-  listModeStateFilesWithScopePreference,
 } from "../mcp/state-paths.js";
 import { generateCodebaseMap } from "./codebase-map.js";
-import { SKILL_ACTIVE_STATE_FILE } from "./keyword-detector.js";
 import { buildExploreRoutingGuidance } from "./explore-routing.js";
+import {
+  SKILL_ACTIVE_STATE_FILE,
+  listActiveSkills,
+  readVisibleSkillActiveStateForStateDir,
+} from "../state/skill-active.js";
+import {
+  OMX_GENERATED_AGENTS_MARKER,
+  OMX_MANAGED_AGENTS_END_MARKER,
+  OMX_MANAGED_AGENTS_START_MARKER,
+} from "../utils/agents-md.js";
 
 const START_MARKER = "<!-- OMX:RUNTIME:START -->";
 const END_MARKER = "<!-- OMX:RUNTIME:END -->";
@@ -47,7 +57,7 @@ const SKILL_REFERENCE_PATTERN = /\/skills\/([^/\s`]+)\/SKILL\.md\b/g;
 // ── Lock helpers ─────────────────────────────────────────────────────────────
 
 function lockPath(cwd: string): string {
-  return join(cwd, ".omx", "state", "agents-md.lock");
+  return join(omxStateDir(cwd), "agents-md.lock");
 }
 
 async function acquireLock(
@@ -170,16 +180,14 @@ async function isRalphActive(
   cwd: string,
   sessionId?: string,
 ): Promise<boolean> {
-  const refs = await listModeStateFilesWithScopePreference(cwd, sessionId);
-  const ralphRef = refs.find((ref) => ref.mode === "ralph");
-  if (!ralphRef) return false;
-
-  try {
-    const data = JSON.parse(await readFile(ralphRef.path, "utf-8"));
-    return data?.active === true;
-  } catch {
-    return false;
-  }
+  const [baseStateDir] = await getAuthoritativeActiveStateDirs(cwd, sessionId);
+  const canonicalState = await readVisibleSkillActiveStateForStateDir(
+    sessionId ? dirname(dirname(baseStateDir)) : baseStateDir,
+    sessionId,
+  );
+  return listActiveSkills(canonicalState ?? {}).some(
+    (entry) => entry.skill === "ralph",
+  );
 }
 
 async function readRalphPlanningArtifacts(
@@ -197,32 +205,31 @@ async function readActiveModes(
   cwd: string,
   sessionId?: string,
 ): Promise<string> {
-  const refs = await listModeStateFilesWithScopePreference(cwd, sessionId);
-
-  const preferredByMode = new Map<
-    string,
-    { mode: string; path: string; scope: "root" | "session" }
-  >();
-  for (const ref of refs) {
-    preferredByMode.set(ref.mode, ref);
-  }
-
+  const [baseStateDir] = await getAuthoritativeActiveStateDirs(cwd, sessionId);
+  const canonicalState = await readVisibleSkillActiveStateForStateDir(
+    sessionId ? dirname(dirname(baseStateDir)) : baseStateDir,
+    sessionId,
+  );
+  const canonicalEntries = listActiveSkills(canonicalState ?? {}).sort((a, b) => a.skill.localeCompare(b.skill));
   const modes: string[] = [];
-  for (const ref of [...preferredByMode.values()].sort((a, b) =>
-    a.mode.localeCompare(b.mode),
-  )) {
+
+  for (const entry of canonicalEntries) {
     try {
-      const data = JSON.parse(await readFile(ref.path, "utf-8"));
-      if (!data.active) continue;
+      const [detailPath] = await getAuthoritativeActiveStatePaths(entry.skill, cwd, sessionId);
+      const data = detailPath && existsSync(detailPath)
+        ? JSON.parse(await readFile(detailPath, "utf-8"))
+        : null;
       const details: string[] = [];
-      if (data.iteration !== undefined)
-        details.push(
-          `iteration ${data.iteration}/${data.max_iterations || "?"}`,
-        );
-      if (data.current_phase) details.push(`phase: ${data.current_phase}`);
-      modes.push(`- ${ref.mode}: ${details.join(", ") || "active"}`);
+      if (data?.iteration !== undefined) {
+        details.push(`iteration ${data.iteration}/${data.max_iterations || "?"}`);
+      }
+      const phase = data?.current_phase || entry.phase;
+      if (phase) details.push(`phase: ${phase}`);
+      modes.push(`- ${entry.skill}: ${details.join(", ") || "active"}`);
     } catch {
-      // Skip malformed mode state files.
+      const details: string[] = [];
+      if (entry.phase) details.push(`phase: ${entry.phase}`);
+      modes.push(`- ${entry.skill}: ${details.join(", ") || "active"}`);
     }
   }
 
@@ -273,12 +280,21 @@ async function readProjectMemorySummary(cwd: string): Promise<string> {
   }
 }
 
+function getNativeSubagentRoutingInstructions(): string {
+  return [
+    "When spawning Codex native subagents, always set `agent_type` to an installed OMX role.",
+    "Use the most specific role (`architect`, `code-reviewer`, `critic`, `planner`, `debugger`, etc.); use `executor` only for generic implementation work.",
+    "Never omit `agent_type` for OMX work: untyped Task subagents appear as default subagents and lose role-specific prompts/routing.",
+  ].join("\n");
+}
+
 function getCompactionInstructions(): string {
   return [
     "Before context compaction, preserve critical state:",
-    "1. Write progress checkpoint via state_write MCP tool",
-    "2. Save key decisions to notepad via notepad_write_working",
-    "3. If context is >80% full, proactively checkpoint state",
+    "1. Write progress checkpoint via `omx state write --input '<json>' --json`",
+    "2. Save key decisions via `omx notepad write-working --input '<json>' --json`",
+    "3. Before large Team work near compaction, reload `.omx/state/team/<team>/preflight-context.json`",
+    "4. If context is >80% full, proactively checkpoint state",
   ].join("\n");
 }
 
@@ -298,8 +314,11 @@ export async function resolveSessionOrchestrationMode(
 ): Promise<SessionOrchestrationMode> {
   if (activeSkill === "team") return "team";
   if (activeSkill) return "default";
+  if (sessionId && !existsSync(getStateDir(cwd, sessionId))) {
+    return "default";
+  }
 
-  const scopedStateDirs = await getReadScopedStateDirs(cwd, sessionId);
+  const scopedStateDirs = await getAuthoritativeActiveStateDirs(cwd, sessionId);
   for (const stateDir of scopedStateDirs) {
     const statePath = join(stateDir, SKILL_ACTIVE_STATE_FILE);
     if (!existsSync(statePath)) continue;
@@ -359,6 +378,12 @@ export async function generateOverlay(
   sections.push({
     key: "session",
     text: truncate(sessionMeta, 200),
+    optional: false,
+  });
+
+  sections.push({
+    key: "native_subagent_routing",
+    text: `**Native Subagent Routing:**\n${truncate(getNativeSubagentRoutingInstructions(), 520)}`,
     optional: false,
   });
 
@@ -450,6 +475,11 @@ export async function generateOverlay(
   const safeBody = capBodyToMax(
     [
       { key: "session", text: truncate(sessionMeta, 200), optional: false },
+      {
+        key: "native_subagent_routing",
+        text: `**Native Subagent Routing:**\n${truncate(getNativeSubagentRoutingInstructions(), 520)}`,
+        optional: false,
+      },
       {
         key: "compaction",
         text: `**Compaction Protocol:**\n${truncate(getCompactionInstructions(), 380)}`,
@@ -590,6 +620,30 @@ function dropShadowedSkillReferenceLines(
   return keptLines.join("\n");
 }
 
+function stripOmxManagedAgentsBlocks(content: string): string {
+  let next = content;
+
+  while (true) {
+    const startIndex = next.indexOf(OMX_MANAGED_AGENTS_START_MARKER);
+    if (startIndex < 0) return next;
+
+    const endIndex = next.indexOf(
+      OMX_MANAGED_AGENTS_END_MARKER,
+      startIndex + OMX_MANAGED_AGENTS_START_MARKER.length,
+    );
+    if (endIndex < 0) return next;
+
+    const replaceEnd = endIndex + OMX_MANAGED_AGENTS_END_MARKER.length;
+    next = `${next.slice(0, startIndex)}${next.slice(replaceEnd)}`;
+  }
+}
+
+function stripGeneratedOmxAgentsForSession(content: string): string {
+  const withoutManagedBlocks = stripOmxManagedAgentsBlocks(content).trim();
+  if (withoutManagedBlocks.includes(OMX_GENERATED_AGENTS_MARKER)) return "";
+  return withoutManagedBlocks;
+}
+
 /**
  * Build a session-scoped AGENTS.md that combines user-level CODEX_HOME
  * instructions, project instructions (if any), and the runtime overlay,
@@ -604,7 +658,8 @@ export async function writeSessionModelInstructionsFile(
   await mkdir(dirname(sessionPath), { recursive: true });
 
   const baseParts: string[] = [];
-  const sourcePaths = [join(codexHome(), "AGENTS.md"), join(cwd, "AGENTS.md")];
+  const userAgentsPath = join(codexHome(), "AGENTS.md");
+  const sourcePaths = [userAgentsPath, join(cwd, "AGENTS.md")];
   const seenPaths = new Set<string>();
   const installedSkills = await listInstalledSkillDirectories(cwd);
   const projectSkillNames = new Set(
@@ -619,11 +674,13 @@ export async function writeSessionModelInstructionsFile(
 
     let content = await readFile(sourcePath, "utf-8");
     content = stripOverlayContent(content).trim();
-    if (sourcePath === join(codexHome(), "AGENTS.md")) {
+    if (sourcePath === userAgentsPath) {
       content = dropShadowedSkillReferenceLines(
         content,
         projectSkillNames,
       ).trim();
+    } else {
+      content = stripGeneratedOmxAgentsForSession(content);
     }
     if (!content) continue;
     baseParts.push(content);

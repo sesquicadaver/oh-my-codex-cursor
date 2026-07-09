@@ -6,7 +6,7 @@
  * blocking hooks.
  */
 
-import { request as httpsRequest } from "https";
+import { requestJson } from "./http-client.js";
 import type {
   DiscordNotificationConfig,
   DiscordBotNotificationConfig,
@@ -21,7 +21,10 @@ import type {
   NotificationEvent,
 } from "./types.js";
 
-import { parseMentionAllowedMentions } from "./config.js";
+import {
+  getEffectiveNotificationPlatformConfig,
+  parseMentionAllowedMentions,
+} from "./config.js";
 
 const SEND_TIMEOUT_MS = 10_000;
 const DISPATCH_TIMEOUT_MS = 15_000;
@@ -129,11 +132,11 @@ export async function sendDiscord(
       body.username = config.username;
     }
 
-    const response = await fetch(config.webhookUrl, {
+    const response = await requestJson(config.webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+      timeoutMs: SEND_TIMEOUT_MS,
     });
 
     if (!response.ok) {
@@ -179,14 +182,14 @@ export async function sendDiscordBot(
       config.mention,
     );
     const url = `https://discord.com/api/v10/channels/${channelId}/messages`;
-    const response = await fetch(url, {
+    const response = await requestJson(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bot ${botToken}`,
       },
       body: JSON.stringify({ content, allowed_mentions }),
-      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+      timeoutMs: SEND_TIMEOUT_MS,
     });
 
     if (!response.ok) {
@@ -238,62 +241,35 @@ export async function sendTelegram(
       parse_mode: config.parseMode || "Markdown",
     });
 
-    const result = await new Promise<NotificationResult>((resolve) => {
-      const req = httpsRequest(
-        {
-          hostname: "api.telegram.org",
-          path: `/bot${config.botToken}/sendMessage`,
-          method: "POST",
-          family: 4,
-          headers: {
-            "Content-Type": "application/json",
-            "Content-Length": Buffer.byteLength(body),
-          },
-          timeout: SEND_TIMEOUT_MS,
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on("data", (chunk: Buffer) => chunks.push(chunk));
-          res.on("end", () => {
-            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-              let messageId: string | undefined;
-              try {
-                const body = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
-                if (body?.result?.message_id !== undefined) {
-                  messageId = String(body.result.message_id);
-                }
-              } catch {
-                // Non-fatal
-              }
-              resolve({ platform: "telegram", success: true, messageId });
-            } else {
-              resolve({
-                platform: "telegram",
-                success: false,
-                error: `HTTP ${res.statusCode}`,
-              });
-            }
-          });
-        },
-      );
-
-      req.on("error", (e) => {
-        resolve({ platform: "telegram", success: false, error: e.message });
-      });
-      req.on("timeout", () => {
-        req.destroy();
-        resolve({
-          platform: "telegram",
-          success: false,
-          error: "Request timeout",
-        });
-      });
-
-      req.write(body);
-      req.end();
+    const response = await requestJson(`https://api.telegram.org/bot${config.botToken}/sendMessage`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": String(Buffer.byteLength(body)),
+      },
+      body,
+      timeoutMs: SEND_TIMEOUT_MS,
     });
 
-    return result;
+    if (!response.ok) {
+      return {
+        platform: "telegram",
+        success: false,
+        error: `HTTP ${response.status}`,
+      };
+    }
+
+    let messageId: string | undefined;
+    try {
+      const responseBody = await response.json() as { result?: { message_id?: unknown } };
+      if (responseBody?.result?.message_id !== undefined) {
+        messageId = String(responseBody.result.message_id);
+      }
+    } catch {
+      // Non-fatal
+    }
+
+    return { platform: "telegram", success: true, messageId };
   } catch (error) {
     return {
       platform: "telegram",
@@ -324,11 +300,11 @@ export async function sendSlack(
       body.username = config.username;
     }
 
-    const response = await fetch(config.webhookUrl, {
+    const response = await requestJson(config.webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+      timeoutMs: SEND_TIMEOUT_MS,
     });
 
     if (!response.ok) {
@@ -371,7 +347,7 @@ export async function sendWebhook(
       ...config.headers,
     };
 
-    const response = await fetch(config.url, {
+    const response = await requestJson(config.url, {
       method: config.method || "POST",
       headers,
       body: JSON.stringify({
@@ -388,7 +364,7 @@ export async function sendWebhook(
         active_mode: payload.activeMode,
         question: payload.question,
       }),
-      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+      timeoutMs: SEND_TIMEOUT_MS,
     });
 
     if (!response.ok) {
@@ -409,25 +385,6 @@ export async function sendWebhook(
   }
 }
 
-function getEffectivePlatformConfig<T>(
-  platform: NotificationPlatform,
-  config: FullNotificationConfig,
-  event: NotificationEvent,
-): T | undefined {
-  const eventConfig = config.events?.[event];
-  const eventPlatform = eventConfig?.[platform as keyof typeof eventConfig];
-
-  if (
-    eventPlatform &&
-    typeof eventPlatform === "object" &&
-    "enabled" in eventPlatform
-  ) {
-    return eventPlatform as T;
-  }
-
-  return config[platform as keyof FullNotificationConfig] as T | undefined;
-}
-
 export async function dispatchNotifications(
   config: FullNotificationConfig,
   event: NotificationEvent,
@@ -435,7 +392,7 @@ export async function dispatchNotifications(
 ): Promise<DispatchResult> {
   const promises: Promise<NotificationResult>[] = [];
 
-  const discordConfig = getEffectivePlatformConfig<DiscordNotificationConfig>(
+  const discordConfig = getEffectiveNotificationPlatformConfig<DiscordNotificationConfig>(
     "discord",
     config,
     event,
@@ -444,7 +401,7 @@ export async function dispatchNotifications(
     promises.push(sendDiscord(discordConfig, payload));
   }
 
-  const telegramConfig = getEffectivePlatformConfig<TelegramNotificationConfig>(
+  const telegramConfig = getEffectiveNotificationPlatformConfig<TelegramNotificationConfig>(
     "telegram",
     config,
     event,
@@ -453,7 +410,7 @@ export async function dispatchNotifications(
     promises.push(sendTelegram(telegramConfig, payload));
   }
 
-  const slackConfig = getEffectivePlatformConfig<SlackNotificationConfig>(
+  const slackConfig = getEffectiveNotificationPlatformConfig<SlackNotificationConfig>(
     "slack",
     config,
     event,
@@ -462,7 +419,7 @@ export async function dispatchNotifications(
     promises.push(sendSlack(slackConfig, payload));
   }
 
-  const webhookConfig = getEffectivePlatformConfig<WebhookNotificationConfig>(
+  const webhookConfig = getEffectiveNotificationPlatformConfig<WebhookNotificationConfig>(
     "webhook",
     config,
     event,
@@ -472,7 +429,7 @@ export async function dispatchNotifications(
   }
 
   const discordBotConfig =
-    getEffectivePlatformConfig<DiscordBotNotificationConfig>(
+    getEffectiveNotificationPlatformConfig<DiscordBotNotificationConfig>(
       "discord-bot",
       config,
       event,
