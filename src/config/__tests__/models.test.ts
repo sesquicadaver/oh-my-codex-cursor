@@ -4,11 +4,18 @@ import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
+  AMBIGUOUS_UNSUPPORTED_REASONING_EFFORTS,
+  CANONICAL_REASONING_EFFORTS,
   DEFAULT_FRONTIER_MODEL,
   DEFAULT_SPARK_MODEL,
   DEFAULT_TEAM_CHILD_MODEL,
-  getAgentReasoningOverride,
+  GPT_5_6_MODEL_ALIASES,
+  KNOWN_CODEX_MODEL_ALIASES,
+  PER_AGENT_REASONING_EFFORTS,
+  ROOT_REASONING_EFFORTS,
+  ROOT_UNSUPPORTED_REASONING_EFFORTS,
   getAgentModelOverride,
+  getAgentReasoningOverride,
   getEnvConfiguredStandardDefaultModel,
   getMainDefaultModel,
   getModelForMode,
@@ -16,9 +23,18 @@ import {
   getStandardDefaultModel,
   getTeamChildModel,
   getTeamLowComplexityModel,
-  readAgentReasoningOverrides,
+  isAmbiguousUnsupportedReasoningEffort,
+  isKnownCodexModelAlias,
+  isUnsupportedRootReasoningEffort,
+  normalizeUnsupportedRootReasoningEffort,
   readAgentModelOverrides,
+  readAgentReasoningOverrides,
   readConfiguredEnvOverrides,
+  type AmbiguousUnsupportedReasoningEffort,
+  type ConfiguredAgentReasoningEffort,
+  type PerAgentReasoningEffort,
+  type RootReasoningEffort,
+  type RootUnsupportedReasoningEffort,
 } from '../models.js';
 
 describe('getModelForMode', () => {
@@ -136,9 +152,9 @@ describe('getModelForMode', () => {
   });
 
   it('uses OMX_DEFAULT_FRONTIER_MODEL when config does not provide a value', () => {
-    process.env.OMX_DEFAULT_FRONTIER_MODEL = 'gpt-5.4-mini';
-    assert.equal(getMainDefaultModel(), 'gpt-5.4-mini');
-    assert.equal(getModelForMode('team'), 'gpt-5.4-mini');
+    process.env.OMX_DEFAULT_FRONTIER_MODEL = 'gpt-5.6-terra';
+    assert.equal(getMainDefaultModel(), 'gpt-5.6-terra');
+    assert.equal(getModelForMode('team'), 'gpt-5.6-terra');
   });
 
   it('uses .omx-config.json env.OMX_DEFAULT_FRONTIER_MODEL when shell env is absent', async () => {
@@ -156,9 +172,9 @@ describe('getModelForMode', () => {
   });
 
   it('uses OMX_DEFAULT_STANDARD_MODEL when configured in shell env', () => {
-    process.env.OMX_DEFAULT_STANDARD_MODEL = 'gpt-5.4-mini-tuned';
-    assert.equal(getEnvConfiguredStandardDefaultModel(), 'gpt-5.4-mini-tuned');
-    assert.equal(getStandardDefaultModel(), 'gpt-5.4-mini-tuned');
+    process.env.OMX_DEFAULT_STANDARD_MODEL = 'gpt-5.6-terra-tuned';
+    assert.equal(getEnvConfiguredStandardDefaultModel(), 'gpt-5.6-terra-tuned');
+    assert.equal(getStandardDefaultModel(), 'gpt-5.6-terra-tuned');
   });
 
   it('uses .omx-config.json env.OMX_DEFAULT_STANDARD_MODEL when shell env is absent', async () => {
@@ -174,23 +190,23 @@ describe('getModelForMode', () => {
   });
 
   it('keeps explicit config default ahead of OMX_DEFAULT_FRONTIER_MODEL', async () => {
-    process.env.OMX_DEFAULT_FRONTIER_MODEL = 'gpt-5.4-mini';
+    process.env.OMX_DEFAULT_FRONTIER_MODEL = 'gpt-5.6-terra';
     await writeConfig({ models: { default: 'o4-mini' } });
     assert.equal(getModelForMode('team'), 'o4-mini');
   });
 
   it('keeps explicit mode config ahead of OMX_DEFAULT_FRONTIER_MODEL', async () => {
-    process.env.OMX_DEFAULT_FRONTIER_MODEL = 'gpt-5.4-mini';
+    process.env.OMX_DEFAULT_FRONTIER_MODEL = 'gpt-5.6-terra';
     await writeConfig({ models: { team: 'gpt-4.1', default: 'o4-mini' } });
     assert.equal(getModelForMode('team'), 'gpt-4.1');
   });
 
 
 
-  it('defaults team child model to standard mini independent of frontier defaults', () => {
+  it('defaults team child model to the standard lane independent of frontier defaults', () => {
     process.env.OMX_DEFAULT_FRONTIER_MODEL = 'frontier-expensive';
-    assert.equal(DEFAULT_TEAM_CHILD_MODEL, 'gpt-5.4-mini');
-    assert.equal(getTeamChildModel(), 'gpt-5.4-mini');
+    assert.equal(DEFAULT_TEAM_CHILD_MODEL, 'gpt-5.6-terra');
+    assert.equal(getTeamChildModel(), 'gpt-5.6-terra');
   });
 
   it('uses OMX_TEAM_CHILD_MODEL shell override for team child model', () => {
@@ -210,10 +226,10 @@ describe('getModelForMode', () => {
   });
 
   it('uses OMX_DEFAULT_SPARK_MODEL when low-complexity config is absent', async () => {
-    process.env.OMX_DEFAULT_SPARK_MODEL = 'gpt-5.3-codex-spark-fast';
+    process.env.OMX_DEFAULT_SPARK_MODEL = 'gpt-5.6-luna-fast';
     await writeConfig({ models: { team: 'gpt-4.1' } });
-    assert.equal(getSparkDefaultModel(), 'gpt-5.3-codex-spark-fast');
-    assert.equal(getTeamLowComplexityModel(), 'gpt-5.3-codex-spark-fast');
+    assert.equal(getSparkDefaultModel(), 'gpt-5.6-luna-fast');
+    assert.equal(getTeamLowComplexityModel(), 'gpt-5.6-luna-fast');
   });
 
   it('uses .omx-config.json env.OMX_DEFAULT_SPARK_MODEL when shell env is absent', async () => {
@@ -222,10 +238,10 @@ describe('getModelForMode', () => {
   });
 
   it('falls back to legacy OMX_SPARK_MODEL when canonical spark env is absent', async () => {
-    process.env.OMX_SPARK_MODEL = 'gpt-5.3-codex-spark-fast';
+    process.env.OMX_SPARK_MODEL = 'gpt-5.6-luna-fast';
     await writeConfig({ models: { team: 'gpt-4.1' } });
-    assert.equal(getSparkDefaultModel(), 'gpt-5.3-codex-spark-fast');
-    assert.equal(getTeamLowComplexityModel(), 'gpt-5.3-codex-spark-fast');
+    assert.equal(getSparkDefaultModel(), 'gpt-5.6-luna-fast');
+    assert.equal(getTeamLowComplexityModel(), 'gpt-5.6-luna-fast');
   });
 
   it('prefers OMX_DEFAULT_SPARK_MODEL over legacy OMX_SPARK_MODEL', () => {
@@ -269,37 +285,136 @@ describe('getModelForMode', () => {
     assert.equal(getAgentReasoningOverride('executor'), undefined);
   });
 
+  it('accepts normalized per-agent max while omitting unsupported and invalid reasoning values', async () => {
+    await writeConfig({
+      agentReasoning: {
+        Architect: 'low',
+        architect: ' MAX ',
+        critic: 'ultra',
+        executor: 'invalid',
+        planner: 'xhigh',
+        empty: '   ',
+        array: ['max'],
+        object: { effort: 'max' },
+        boolean: true,
+        number: 5,
+      },
+    });
+
+    assert.deepEqual(readAgentReasoningOverrides(), {
+      architect: 'max',
+      planner: 'xhigh',
+    });
+    assert.equal(getAgentReasoningOverride('ARCHITECT'), 'max');
+    assert.equal(getAgentReasoningOverride('critic'), undefined);
+    assert.equal(getAgentReasoningOverride('executor'), undefined);
+  });
+
+  it('keeps legacy, per-agent, and root reasoning vocabularies distinct', () => {
+    const legacyEffort: ConfiguredAgentReasoningEffort = 'xhigh';
+    const perAgentEffort: PerAgentReasoningEffort = 'max';
+    const rootEffort: RootReasoningEffort = 'xhigh';
+    const rootUnsupportedEffort: RootUnsupportedReasoningEffort = 'max';
+    void legacyEffort;
+    void perAgentEffort;
+    void rootEffort;
+    void rootUnsupportedEffort;
+    const ambiguousUnsupportedEffort: AmbiguousUnsupportedReasoningEffort = 'ultra';
+    void ambiguousUnsupportedEffort;
+
+    // @ts-expect-error Legacy configured reasoning remains four-valued.
+    const legacyMax: ConfiguredAgentReasoningEffort = 'max';
+    // @ts-expect-error Root reasoning remains four-valued.
+    const rootMax: RootReasoningEffort = 'max';
+    // @ts-expect-error Root unsupported tokens exclude unknown values.
+    const rootUnknown: RootUnsupportedReasoningEffort = 'future';
+    void legacyMax;
+    void rootMax;
+    void rootUnknown;
+    // @ts-expect-error Per-agent reasoning excludes ultra.
+    const perAgentUltra: PerAgentReasoningEffort = 'ultra';
+    // @ts-expect-error Legacy unsupported tokens exclude supported values.
+    const ambiguousHigh: AmbiguousUnsupportedReasoningEffort = 'high';
+    void perAgentUltra;
+    void ambiguousHigh;
+
+    assert.deepEqual(CANONICAL_REASONING_EFFORTS, ['low', 'medium', 'high', 'xhigh']);
+    assert.deepEqual(AMBIGUOUS_UNSUPPORTED_REASONING_EFFORTS, ['max', 'ultra']);
+    assert.deepEqual(PER_AGENT_REASONING_EFFORTS, ['low', 'medium', 'high', 'xhigh', 'max']);
+    assert.deepEqual(ROOT_REASONING_EFFORTS, ['low', 'medium', 'high', 'xhigh']);
+    assert.deepEqual(ROOT_UNSUPPORTED_REASONING_EFFORTS, ['max', 'ultra']);
+    assert.notStrictEqual(ROOT_REASONING_EFFORTS, CANONICAL_REASONING_EFFORTS);
+
+    assert.equal(isAmbiguousUnsupportedReasoningEffort('MAX'), true);
+    assert.equal(isAmbiguousUnsupportedReasoningEffort(' max '), false);
+
+    const ambiguousCandidate = 'MAX' as string;
+    if (isAmbiguousUnsupportedReasoningEffort(ambiguousCandidate)) {
+      const narrowedAmbiguousCandidate: AmbiguousUnsupportedReasoningEffort = ambiguousCandidate;
+      void narrowedAmbiguousCandidate;
+    }
+    assert.equal(isUnsupportedRootReasoningEffort('MAX'), true);
+    assert.equal(isUnsupportedRootReasoningEffort('ulTRA'), true);
+    assert.equal(isUnsupportedRootReasoningEffort(' ultra '), false);
+    assert.equal(isUnsupportedRootReasoningEffort('xhigh'), false);
+    assert.equal(normalizeUnsupportedRootReasoningEffort(' MAX '), 'max');
+    assert.equal(normalizeUnsupportedRootReasoningEffort(' Ultra '), 'ultra');
+    assert.equal(normalizeUnsupportedRootReasoningEffort('xhigh'), undefined);
+
+    const rootCandidate = 'MAX' as string;
+    if (isUnsupportedRootReasoningEffort(rootCandidate)) {
+      // @ts-expect-error Root classification must not narrow arbitrary strings.
+      const narrowedRootCandidate: RootUnsupportedReasoningEffort = rootCandidate;
+      void narrowedRootCandidate;
+    }
+  });
+
+
   it('reads normalized per-agent model overrides from .omx-config.json', async () => {
     await writeConfig({
       agentModels: {
-        Architect: ' gpt-5.5 ',
-        critic: 'gpt-5.4',
+        Architect: ' gpt-5.6-sol ',
+        critic: 'gpt-5.5',
         executor: '',
         researcher: 42,
         'bad role': 'gpt-5',
+        reviewer: ' gpt-5.6-terra ',
       },
     });
 
     assert.deepEqual(readAgentModelOverrides(), {
-      architect: 'gpt-5.5',
-      critic: 'gpt-5.4',
+      architect: 'gpt-5.6-sol',
+      critic: 'gpt-5.5',
+      reviewer: 'gpt-5.6-terra',
     });
-    assert.equal(getAgentModelOverride('ARCHITECT'), 'gpt-5.5');
+    assert.equal(getAgentModelOverride('ARCHITECT'), 'gpt-5.6-sol');
     assert.equal(getAgentModelOverride('executor'), undefined);
     assert.equal(getAgentModelOverride('bad role'), undefined);
   });
 
+  it('lists GPT-5.6 Terra/Luna/Sol as known Codex model aliases', () => {
+    assert.deepEqual([...GPT_5_6_MODEL_ALIASES], [
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-5.6-sol',
+    ]);
+    for (const alias of GPT_5_6_MODEL_ALIASES) {
+      assert.equal(isKnownCodexModelAlias(alias), true);
+      assert.equal(KNOWN_CODEX_MODEL_ALIASES.includes(alias), true);
+    }
+  });
+
   it('keeps explicit low-complexity config ahead of OMX_DEFAULT_SPARK_MODEL', async () => {
     // Intentional legacy model fixture: explicit user config must outrank current spark defaults.
-    process.env.OMX_DEFAULT_SPARK_MODEL = 'gpt-5.3-codex-spark-fast';
+    process.env.OMX_DEFAULT_SPARK_MODEL = 'gpt-5.6-luna-fast';
     await writeConfig({ models: { team_low_complexity: 'gpt-4.1-mini' } });
     assert.equal(getTeamLowComplexityModel(), 'gpt-4.1-mini');
   });
 
   it('inherits the main default for standard agents when no standard override is configured', async () => {
-    process.env.OMX_DEFAULT_FRONTIER_MODEL = 'gpt-5.5-custom';
+    process.env.OMX_DEFAULT_FRONTIER_MODEL = 'gpt-5.6-sol-custom';
     await writeConfig({ models: { team: 'gpt-4.1' } });
-    assert.equal(getStandardDefaultModel(), 'gpt-5.5-custom');
+    assert.equal(getStandardDefaultModel(), 'gpt-5.6-sol-custom');
   });
 
   it('returns canonical spark fallback when not configured', async () => {

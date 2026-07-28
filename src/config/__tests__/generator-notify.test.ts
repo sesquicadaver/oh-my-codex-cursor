@@ -17,39 +17,19 @@ describe('config generator', () => {
       const notifyIdx = toml.indexOf('notify =');
       const reasoningIdx = toml.indexOf('model_reasoning_effort =');
       const devInstrIdx = toml.indexOf('developer_instructions =');
-      const modelIdx = toml.indexOf('model = "gpt-5.5"');
-      const seededStartIdx = toml.indexOf(
-        '# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)',
-      );
-      const contextIdx = toml.indexOf('model_context_window = 250000');
-      const compactIdx = toml.indexOf('model_auto_compact_token_limit = 200000');
-      const seededEndIdx = toml.indexOf('# End oh-my-codex seeded behavioral defaults');
+      const modelIdx = toml.indexOf('model = "gpt-5.6-sol"');
       const featuresIdx = toml.indexOf('[features]');
 
       assert.ok(notifyIdx >= 0, 'notify not found');
       assert.ok(reasoningIdx >= 0, 'model_reasoning_effort not found');
       assert.ok(devInstrIdx >= 0, 'developer_instructions not found');
       assert.ok(modelIdx >= 0, 'model not found');
-      assert.ok(seededStartIdx >= 0, 'seeded defaults start marker not found');
-      assert.ok(contextIdx >= 0, 'model_context_window not found');
-      assert.ok(compactIdx >= 0, 'model_auto_compact_token_limit not found');
-      assert.ok(seededEndIdx >= 0, 'seeded defaults end marker not found');
       assert.ok(featuresIdx >= 0, '[features] not found');
 
       assert.ok(notifyIdx < featuresIdx, 'notify must come before [features]');
       assert.ok(reasoningIdx < featuresIdx, 'model_reasoning_effort must come before [features]');
       assert.ok(devInstrIdx < featuresIdx, 'developer_instructions must come before [features]');
       assert.ok(modelIdx < featuresIdx, 'model must come before [features]');
-      assert.ok(
-        seededStartIdx < featuresIdx,
-        'seeded defaults start marker must come before [features]',
-      );
-      assert.ok(contextIdx < featuresIdx, 'model_context_window must come before [features]');
-      assert.ok(compactIdx < featuresIdx, 'model_auto_compact_token_limit must come before [features]');
-      assert.ok(
-        seededEndIdx < featuresIdx,
-        'seeded defaults end marker must come before [features]',
-      );
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -69,45 +49,24 @@ describe('config generator', () => {
     }
   });
 
-  it('seeds gpt-5.5 model and context defaults for fresh configs', async () => {
+  it('does not seed context defaults for fresh configs', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-config-gen-'));
     try {
       const configPath = join(wd, 'config.toml');
       await mergeConfig(configPath, wd);
       const toml = await readFile(configPath, 'utf-8');
 
-      assert.match(toml, /^model = "gpt-5\.5"$/m);
-      assert.match(
-        toml,
-        /^# oh-my-codex seeded behavioral defaults \(uninstall removes unchanged defaults\)$/m,
-      );
-      assert.match(toml, /^model_context_window = 250000$/m);
-      assert.match(toml, /^model_auto_compact_token_limit = 200000$/m);
-      assert.match(toml, /^# End oh-my-codex seeded behavioral defaults$/m);
-    } finally {
-      await rm(wd, { recursive: true, force: true });
-    }
-  });
+      assert.match(toml, /^model = "gpt-5\.6-sol"$/m);
+      assert.doesNotMatch(toml, /seeded behavioral defaults/);
+      assert.doesNotMatch(toml, /^model_context_window\s*=/m);
+      assert.doesNotMatch(toml, /^model_auto_compact_token_limit\s*=/m);
 
-  it('seeds default model and context settings on fresh config', async () => {
-    const wd = await mkdtemp(join(tmpdir(), 'omx-config-gen-'));
-    try {
-      const configPath = join(wd, 'config.toml');
       await mergeConfig(configPath, wd);
-      const toml = await readFile(configPath, 'utf-8');
-
-      assert.match(toml, /^model = "gpt-5\.5"$/m);
-      assert.match(
-        toml,
-        /^# oh-my-codex seeded behavioral defaults \(uninstall removes unchanged defaults\)$/m,
-      );
-      assert.match(toml, /^model_context_window = 250000$/m);
-      assert.match(toml, /^model_auto_compact_token_limit = 200000$/m);
-      assert.match(toml, /^# End oh-my-codex seeded behavioral defaults$/m);
-
-      const modelIdx = toml.indexOf('model = "gpt-5.5"');
-      const featuresIdx = toml.indexOf('[features]');
-      assert.ok(modelIdx >= 0 && modelIdx < featuresIdx, 'seeded model must come before [features]');
+      const repeated = await readFile(configPath, 'utf-8');
+      assert.equal(repeated, toml);
+      assert.doesNotMatch(repeated, /seeded behavioral defaults/);
+      assert.doesNotMatch(repeated, /^model_context_window\s*=/m);
+      assert.doesNotMatch(repeated, /^model_auto_compact_token_limit\s*=/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -125,7 +84,12 @@ describe('config generator', () => {
       assert.match(toml, /AGENTS\.md is the orchestration brain and main control surface/);
       assert.match(toml, /Follow AGENTS\.md for skill\/keyword routing, \$name workflow invocation, and role-specialized subagents/);
       assert.match(toml, /Native subagents live in \.codex\/agents/);
-      assert.match(toml, /set `agent_type` to an installed role and never omit it for OMX work/);
+      assert.match(toml, /when the native surface exposes `agent_type` role routing, set `agent_type` to an installed role and never omit it for OMX work/i);
+      assert.match(toml, /role_routing_unavailable/i);
+      assert.match(toml, /do not fabricate `agent_type`/i);
+      assert.match(toml, /omx ralplan preflight --json/i);
+      assert.match(toml, /unsupported_documented_leader_proof/i);
+      assert.match(toml, /never fake the role via a prompt label/i);
       assert.match(toml, /Treat installed prompts as narrower execution surfaces under AGENTS\.md authority/);
       assert.match(toml, new RegExp(`^developer_instructions = "${OMX_DEVELOPER_INSTRUCTIONS.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"$`, 'm'));
     } finally {
@@ -175,7 +139,7 @@ describe('config generator', () => {
 
       // Features correct
       assert.equal((rerun.match(/^\[features\]$/gm) ?? []).length, 1);
-      assert.match(rerun, /^multi_agent = true$/m);
+      assert.doesNotMatch(rerun, /^multi_agent\s*=/m);
       assert.match(rerun, /^child_agents_md = true$/m);
 
       // User content preserved
@@ -194,27 +158,27 @@ describe('config generator', () => {
     }
   });
 
-  it('seeds only the missing gpt-5.5 context key while preserving an existing partner value', async () => {
+  it('does not add a missing context partner to explicit settings', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-config-gen-'));
     try {
       const configPath = join(wd, 'config.toml');
       await writeFile(
         configPath,
-        ['model = "gpt-5.5"', 'model_context_window = 640000', ''].join('\n'),
+        ['model = "gpt-5.6-sol"', 'model_context_window = 640000', ''].join('\n'),
       );
 
       await mergeConfig(configPath, wd);
       const toml = await readFile(configPath, 'utf-8');
 
-      assert.match(toml, /^model = "gpt-5\.5"$/m);
+      assert.match(toml, /^model = "gpt-5\.6-sol"$/m);
       assert.match(toml, /^model_context_window = 640000$/m);
-      assert.match(toml, /^model_auto_compact_token_limit = 200000$/m);
+      assert.doesNotMatch(toml, /^model_auto_compact_token_limit\s*=/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it('does not seed 250k context keys for non-gpt-5.5 models', async () => {
+  it('does not add context keys for non-gpt-5.6-sol models', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-config-gen-'));
     try {
       const configPath = join(wd, 'config.toml');
@@ -259,24 +223,24 @@ describe('config generator', () => {
       // User's feature flag preserved
       assert.match(toml, /^web_search = true$/m);
 
-      // OMX feature flags added
-      assert.match(toml, /^multi_agent = true$/m);
+      // OMX feature flags added without legacy multi-agent configuration
+      assert.doesNotMatch(toml, /^multi_agent\s*=/m);
       assert.match(toml, /^goals = true$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it('writes a global [agents] section with OMX defaults', async () => {
+  it('does not write retired global [agents] defaults', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-config-gen-'));
     try {
       const configPath = join(wd, 'config.toml');
       await mergeConfig(configPath, wd);
       const toml = await readFile(configPath, 'utf-8');
 
-      assert.match(toml, /^\[agents\]$/m);
-      assert.match(toml, /^max_threads = 6$/m);
-      assert.match(toml, /^max_depth = 2$/m);
+      assert.doesNotMatch(toml, /^\[agents\]$/m);
+      assert.doesNotMatch(toml, /^max_threads\s*=/m);
+      assert.doesNotMatch(toml, /^max_depth\s*=/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -303,8 +267,8 @@ describe('config generator', () => {
       // collab must be gone
       assert.ok(!/^\s*collab\s*=/m.test(toml), 'deprecated collab key should be removed');
 
-      // multi_agent replaces it
-      assert.match(toml, /^multi_agent = true$/m);
+      // The retired flag is removed without introducing multi_agent.
+      assert.doesNotMatch(toml, /^multi_agent\s*=/m);
 
       // other user flags preserved
       assert.match(toml, /^web_search = true$/m);
@@ -375,7 +339,7 @@ describe('config generator', () => {
 
       assert.equal((merged.match(/^\[features\]$/gm) ?? []).length, 1);
       assert.match(merged, /^custom_user_flag = false$/m);
-      assert.match(merged, /^multi_agent = true$/m);
+      assert.doesNotMatch(merged, /^multi_agent\s*=/m);
       assert.match(merged, /^child_agents_md = true$/m);
       assert.match(merged, /^hooks = true$/m);
       assert.match(merged, /^goals = true$/m);

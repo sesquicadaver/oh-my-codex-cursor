@@ -26,7 +26,7 @@ Current code recognizes these top-level `.omx-config.json` keys:
 | Top-level key | Supported shape | Primary use |
 | --- | --- | --- |
 | `agentModels` | Object mapping agent names to non-empty model strings | Optional per-agent model overrides for generated native agent TOML, AGENTS.md model tables, and role-based worker/Ralph fallback routing. |
-| `agentReasoning` | Object mapping agent names to `low`, `medium`, `high`, or `xhigh` | Optional per-agent reasoning overrides for generated native agent TOML and role-based worker/Ralph staffing guidance. |
+| `agentReasoning` | Object mapping agent names to `low`, `medium`, `high`, `xhigh`, or `max` | Optional per-agent reasoning overrides for generated native agent TOML and role-based worker/Ralph staffing guidance.
 | `env` | Object of non-empty string values | Fallback environment values for model routing and helper launch paths. Model-related supported keys are listed below. |
 | `models` | Object of non-empty string values | Mode defaults and low-complexity model aliases. Supported model-routing keys are listed below. |
 | `notifications` | Object | Notification transports, profiles, templates, cooldowns, replies, and OpenClaw/custom aliases. See the notification summary below and the OpenClaw guide for full examples. |
@@ -57,24 +57,24 @@ The model-routing reader supports `env`, `models`, and the per-role override map
 ```json
 {
   "agentModels": {
-    "planner": "gpt-5.5",
-    "architect": "gpt-5.5",
-    "researcher": "gpt-5.5",
-    "explore": "gpt-5.5"
+    "planner": "gpt-5.6-sol",
+    "architect": "gpt-5.6-sol",
+    "researcher": "gpt-5.6-terra",
+    "explore": "gpt-5.6-luna"
   },
   "agentReasoning": {
     "architect": "xhigh",
     "critic": "xhigh"
   },
   "env": {
-    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.5",
-    "OMX_DEFAULT_STANDARD_MODEL": "gpt-5.4-mini",
-    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.3-codex-spark"
+    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.6-sol",
+    "OMX_DEFAULT_STANDARD_MODEL": "gpt-5.6-terra",
+    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.6-luna"
   },
   "models": {
-    "default": "gpt-5.5",
-    "team": "gpt-5.5",
-    "team_low_complexity": "gpt-5.3-codex-spark"
+    "default": "gpt-5.6-sol",
+    "team": "gpt-5.6-sol",
+    "team_low_complexity": "gpt-5.6-luna"
   }
 }
 ```
@@ -109,6 +109,9 @@ For `omx sparkshell`, the documented helper-specific environment keys are:
 
 `models` maps mode names to explicit model overrides. Values must be non-empty strings.
 
+The built-in defaults are `gpt-5.6-sol` (frontier), `gpt-5.6-terra` (standard), and `gpt-5.6-luna` (spark); the known-alias list contains exactly these three GPT-5.6 models. Legacy prior-generation names (for example `gpt-5.5`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`) are not aliases and carry no special routing meaning; like any provider-specific model name, they pass through only as opaque override strings. The known-alias list is used for display and contract tests, not as a closed allow-list.
+
+
 Supported model-routing keys:
 
 | Key shape | Purpose |
@@ -128,10 +131,10 @@ Do not invent per-role maps such as `models.executor`, `models.architect`, or `m
 ```json
 {
   "agentModels": {
-    "architect": "gpt-5.5",
-    "planner": "gpt-5.5",
-    "researcher": "gpt-5.5",
-    "explore": "gpt-5.5"
+    "architect": "gpt-5.6-sol",
+    "planner": "gpt-5.6-sol",
+    "researcher": "gpt-5.6-terra",
+    "explore": "gpt-5.6-luna"
   }
 }
 ```
@@ -141,7 +144,7 @@ These overrides do not change built-in defaults in source. They are user/project
 For a named role, effective model precedence is:
 
 1. `.omx-config.json` `agentModels[role]`
-2. Built-in `exactModel` pins, such as planner/architect `gpt-5.5` or researcher `gpt-5.4-mini`
+2. Built-in `exactModel` pins, such as planner/architect `gpt-5.6-sol` or researcher `gpt-5.6-terra`
 3. Special role logic, such as `executor` using the main/frontier lane
 4. `modelClass` routing: `fast` uses spark/low-complexity, `frontier` uses main/frontier, and `standard` uses the standard lane
 
@@ -149,18 +152,20 @@ For a named role, effective model precedence is:
 
 ### `agentReasoning`
 
-`agentReasoning` is the supported per-agent reasoning override map. Keys are agent names and values must be one of `low`, `medium`, `high`, or `xhigh`.
+`agentReasoning` is the supported **per-agent** reasoning override map. Keys are normalized agent names; configured string values are trimmed and case-normalized to exactly `low`, `medium`, `high`, `xhigh`, or `max`. This normalization is configuration-only: it does not make `max` a root CLI value or launch shorthand.
+
+`max` is passed unchanged to generated native-agent TOML and Team role defaults. Its availability remains capability-dependent on the installed Codex version, selected model, and provider; OMX does not probe capability, downgrade or retry it as `xhigh`, or hide downstream errors. `ultra` is unsupported on OMX-owned `agentReasoning` surfaces and is not an alias for `max`.
 
 ```json
 {
   "agentReasoning": {
-    "architect": "xhigh",
+    "architect": "MAX",
     "critic": "xhigh"
   }
 }
 ```
 
-These overrides do not change built-in defaults in source. They are user/project configuration that applies when OMX resolves role reasoning for generated native agent TOML and role-based team/Ralph staffing/worker guidance. Rerun `omx setup` after changing this map so setup-managed native agent TOML files are regenerated. Malformed agent names, empty values, and unsupported effort values are ignored.
+These overrides do not change built-in defaults in source. Every built-in `AgentDefinition.reasoningEffort` remains required and one of `low`, `medium`, `high`, or `xhigh`; it is never omitted, `max`, or `ultra`. A valid override affects only that normalized agent key. Malformed agent names, empty/non-string values, `ultra`, and unknown values are ignored, so valid sibling overrides remain effective and an affected role keeps its unchanged built-in fallback. Rerun `omx setup --force` after changing this map so setup-managed native agent TOML files are regenerated.
 
 ## Effective model precedence
 
@@ -173,7 +178,7 @@ The main default resolves in this order:
 1. Shell `OMX_DEFAULT_FRONTIER_MODEL`
 2. `.omx-config.json` `env.OMX_DEFAULT_FRONTIER_MODEL`
 3. Active Codex `config.toml` root `model`
-4. Built-in default: `gpt-5.5`
+4. Built-in default: `gpt-5.6-sol`
 
 ### Mode-specific model lookup
 
@@ -183,7 +188,7 @@ When code asks for `getModelForMode(mode)`, the mode model resolves in this orde
 2. `.omx-config.json` `models.default`
 3. Main/frontier default above
 
-Example: with `models.team = "gpt-5.5"` and `models.default = "gpt-5.4-mini"`, `team` uses `gpt-5.5`; a mode without its own key uses `gpt-5.4-mini`.
+Example: with `models.team = "gpt-5.6-sol"` and `models.default = "gpt-5.6-terra"`, `team` uses `gpt-5.6-sol`; a mode without its own key uses `gpt-5.6-terra`.
 
 ### Standard-lane agents
 
@@ -204,7 +209,7 @@ Spark/fast defaults resolve in this order:
 3. `.omx-config.json` `env.OMX_DEFAULT_SPARK_MODEL`
 4. `.omx-config.json` legacy `env.OMX_SPARK_MODEL`
 5. `.omx-config.json` `models.team_low_complexity`, `models.team-low-complexity`, or `models.teamLowComplexity`
-6. Built-in default: `gpt-5.3-codex-spark`
+6. Built-in default: `gpt-5.6-luna`
 
 For team low-complexity helpers, the exact order depends on the call path: `getSparkDefaultModel()` checks spark env/config values before low-complexity aliases, while `getTeamLowComplexityModel()` checks low-complexity aliases before falling back to the spark default.
 
@@ -216,7 +221,7 @@ Examples:
 
 | Role/category | Examples | Model class behavior |
 | --- | --- | --- |
-| Exact planning/research pins | `planner`, `architect`, `researcher` | Uses the built-in `exactModel` pin before model-class routing unless `agentModels[role]` is set; planner uses exact `gpt-5.5` with medium reasoning, architect uses exact `gpt-5.5` with xhigh reasoning, and researcher stays on exact `gpt-5.4-mini`. Ralplan's `critic` remains frontier-routed for the consensus gate. In Autopilot, `planning_routing.owner` switches the initial ralplan Planner draft/decomposition to this dedicated `planner` role when `[main]` is cheap/mini or when `agentModels.planner` is configured. |
+| Exact planning/research pins | `planner`, `architect`, `researcher` | Uses the built-in `exactModel` pin before model-class routing unless `agentModels[role]` is set; planner uses exact `gpt-5.6-sol` with medium reasoning, architect uses exact `gpt-5.6-sol` with xhigh reasoning, and researcher stays on exact `gpt-5.6-terra`. Ralplan's `critic` remains frontier-routed for the consensus gate. In Autopilot, `planning_routing.owner` switches the initial ralplan Planner draft/decomposition to this dedicated `planner` role when `[main]` is cheap/mini or when `agentModels.planner` is configured. |
 | Frontier orchestration | `critic`, `code-reviewer`, `security-reviewer`, `team-executor`, `vision` | Native-agent generation uses active `config.toml` root `model` first, then the main/frontier default fallback. |
 | Standard worker/review | `debugger`, `quality-reviewer`, `api-reviewer`, `performance-reviewer`, `dependency-expert`, `writer` | Uses the standard-lane default, which inherits main/frontier unless `OMX_DEFAULT_STANDARD_MODEL` is set. |
 | Fast/low-complexity | `explore`, `style-reviewer` | Uses the spark/low-complexity default. |
@@ -235,21 +240,17 @@ Use `omx team status <team-name> --model-inspect` when you need inspect hints fo
 
 `.omx-config.json` is **not** the general place to configure root `model_reasoning_effort`. Do not add arbitrary keys such as `reasoningEffort`, `modelReasoningEffort`, `reasoning`, or undeclared per-role reasoning maps. The supported per-agent override map is exactly `agentReasoning`.
 
-Supported reasoning-effort surfaces are:
+Root and per-agent reasoning vocabularies are deliberately separate:
 
-- Active Codex `config.toml` root key: `model_reasoning_effort = "medium"`.
-- `omx reasoning <low|medium|high|xhigh>`, which edits the active Codex `config.toml`.
-- `omx --high` and `omx --xhigh`, which pass `-c model_reasoning_effort="high|xhigh"` to Codex launch.
-- Generated native agent TOML files, where OMX writes each role's built-in `reasoningEffort` metadata.
-- `.omx-config.json` `agentReasoning`, which overrides selected role defaults for generated native agent TOML and role-based team/Ralph reasoning allocation without changing built-in defaults.
-- Team worker launch args, for example:
+- Root `config.toml` accepts `model_reasoning_effort = "low"`, `"medium"`, `"high"`, or `"xhigh"`.
+- `omx reasoning <low|medium|high|xhigh>` edits that root setting. There is no `omx reasoning max`, `omx --max`, or root `max` shorthand.
+- `omx --high` and `omx --xhigh` pass `-c model_reasoning_effort="high|xhigh"` to Codex launch.
+- `.omx-config.json` `agentReasoning` accepts the five configured per-agent values described above and overrides selected role defaults for generated native agent TOML and role-based Team/Ralph staffing without changing built-in defaults.
+- Generated native agent TOML files otherwise write each role's unchanged built-in `reasoningEffort` metadata.
 
-```bash
-OMX_TEAM_WORKER_LAUNCH_ARGS='-c model_reasoning_effort="low" --model gpt-5.3-codex-spark' \
-  omx team 3:explore "map the config surfaces"
-```
+Team runtime can inject a role-default or `agentReasoning`-overridden value when no explicit reasoning override is present. Explicit raw `-c model_reasoning_effort=...` is opaque Codex passthrough: it wins over configured and built-in role defaults, is forwarded unchanged (including `ultra` or future values), and preserves inherited Team explicit reasoning precedence over environment explicit reasoning. OMX does not validate, normalize, downgrade, retry, or claim provider support for that raw value.
 
-Team runtime can also inject role-default or `agentReasoning`-overridden reasoning for Codex workers when no explicit reasoning override is present. Explicit launch args win.
+The launch parser has one narrow end-of-options rule: literal `--max` and `--ultra` are rejected as OMX shorthands before `--`, but `omx -- --max` and `omx -- --ultra` are passed through unchanged to Codex. This does not make unrelated post-`--` arguments an OMX configuration surface.
 
 ## Starter configs
 
@@ -262,14 +263,14 @@ This keeps orchestration on the frontier default, routes standard workers to a c
 ```json
 {
   "env": {
-    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.5",
-    "OMX_DEFAULT_STANDARD_MODEL": "gpt-5.4-mini",
-    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.3-codex-spark"
+    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.6-sol",
+    "OMX_DEFAULT_STANDARD_MODEL": "gpt-5.6-terra",
+    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.6-luna"
   },
   "models": {
-    "default": "gpt-5.4-mini",
-    "team": "gpt-5.5",
-    "team_low_complexity": "gpt-5.3-codex-spark"
+    "default": "gpt-5.6-terra",
+    "team": "gpt-5.6-sol",
+    "team_low_complexity": "gpt-5.6-luna"
   }
 }
 ```
@@ -281,10 +282,10 @@ This keeps standard agents inheriting the frontier model by omitting `OMX_DEFAUL
 ```json
 {
   "agentModels": {
-    "planner": "gpt-5.5",
-    "architect": "gpt-5.5",
-    "researcher": "gpt-5.5",
-    "explore": "gpt-5.5"
+    "planner": "gpt-5.6-sol",
+    "architect": "gpt-5.6-sol",
+    "researcher": "gpt-5.6-terra",
+    "explore": "gpt-5.6-luna"
   },
   "agentReasoning": {
     "planner": "medium",
@@ -294,25 +295,25 @@ This keeps standard agents inheriting the frontier model by omitting `OMX_DEFAUL
     "critic": "xhigh"
   },
   "env": {
-    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.5",
-    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.3-codex-spark"
+    "OMX_DEFAULT_FRONTIER_MODEL": "gpt-5.6-sol",
+    "OMX_DEFAULT_SPARK_MODEL": "gpt-5.6-luna"
   },
   "models": {
-    "default": "gpt-5.5",
-    "team": "gpt-5.5",
-    "autopilot": "gpt-5.5",
-    "ralph": "gpt-5.5",
-    "team_low_complexity": "gpt-5.3-codex-spark"
+    "default": "gpt-5.6-sol",
+    "team": "gpt-5.6-sol",
+    "autopilot": "gpt-5.6-sol",
+    "ralph": "gpt-5.6-sol",
+    "team_low_complexity": "gpt-5.6-luna"
   }
 }
 ```
 
 ## Verifying the effective config
 
-After editing `.omx-config.json` or `config.toml`, run setup/doctor from the same shell and project shape that will launch OMX:
+After editing `.omx-config.json` `agentReasoning` or `config.toml`, regenerate setup-managed native agent TOML from the same shell and project shape that will launch OMX:
 
 ```bash
-omx setup
+omx setup --force
 omx doctor
 ```
 

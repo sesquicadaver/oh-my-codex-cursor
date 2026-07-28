@@ -9,13 +9,13 @@
 [![npm version](https://img.shields.io/npm/v/oh-my-codex)](https://www.npmjs.com/package/oh-my-codex)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
-[![Discord](https://img.shields.io/discord/1452487457085063218?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/sj4exxQ9v)
+[![Discord](https://img.shields.io/discord/1452487457085063218?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/jq6jnSGABY)
 
 **Website:** https://yeachan-heo.github.io/oh-my-codex-website/
 
 **Docs:** [Getting Started](./docs/getting-started.html) · [Agents](./docs/agents.html) · [Skills](./docs/skills.html) · [Integrations](./docs/integrations.html) · [Demo](./DEMO.md) · [OpenClaw guide](./docs/openclaw-integration.md)
 
-**Community:** [Discord](https://discord.gg/sj4exxQ9v) — shared OMX/community server for oh-my-codex and related tooling.
+**Community:** [Discord](https://discord.gg/jq6jnSGABY) — shared OMX/community server for oh-my-codex and related tooling.
 
 ## Official project and package
 
@@ -92,6 +92,15 @@ Choose the setup scope deliberately:
 - Use `omx setup --scope user` for user-level Codex setup when you are not preparing the current directory as an OMX project.
 - Avoid running project-scoped setup from a broad home directory or operating hub unless that directory is intentionally the project under review. A home-level `AGENTS.md` often contains global safety and routing rules; keep project-specific OMX runtime guidance in the real repository instead.
 
+### Persisting an explicit AGENTS merge policy
+
+`omx setup --merge-agents`, `omx setup --no-merge-agents`, and `omx setup --clear-merge-agents-policy` are the only policy selectors; use their bare forms (not `=value` spellings). Repeating an identical selector is harmless, but mixing set and clear choices fails before setup changes anything. An explicit set overrides a saved policy. A successful explicit set records `mergeAgents: true` or `false` in the current working root's `./.omx/setup-scope.json`, even when setup scope is `user`; it never becomes a global user preference or leaks to another root. Later `omx update` replays a valid matching policy for both immediate and deferred refreshes.
+
+`true` takes the existing merge branch. `false` only suppresses that branch: it does not promise preservation, replacement, or any new safety mode, so the existing prompt, skip, managed-refresh, plugin-default, and force behavior still applies. A matching-scope review retains the policy while unrelated settings change. Reset or a scope change removes the inherited policy unless the same setup run explicitly sets `true` or `false`; clear always removes the policy and cannot be combined with a set selector. Malformed, unknown, nonboolean, or wrong-scope saved data is ignored safely.
+
+`--force` is independent and transient: it is neither recorded nor replayed, and does not override an explicit merge policy. Setup atomically commits explicit set or clear intent only after all setup work succeeds, including when active-session or plugin-symlink safeguards skip the current `AGENTS.md` write, so the next refresh can honor the requested policy. This does not make merge the default or revive the rejected #2892 merge-by-default approach. Older OMX versions safely ignore the field, but may erase it when rewriting their known setup preferences.
+
+
 **Codex plugin install note:** this repo also ships an official Codex plugin layout at `plugins/oh-my-codex` with marketplace metadata in `.agents/plugins/marketplace.json`. That plugin bundles the mirrored skill surface plus plugin-scoped companion metadata for official Codex lifecycle hooks, optional MCP compatibility servers, and apps. It is still **not** a replacement for the global `oh-my-codex` CLI plus scoped setup: plugin-scoped hooks launch the installed `omx` CLI, legacy setup mode installs native agents and prompts, and plugin setup mode relies on plugin discovery for bundled skills while archiving/removing legacy OMX-managed prompts/native-agent TOMLs so stale role files cannot shadow plugin behavior. Plugin mode still needs a persistent scope `AGENTS.md` (`~/.codex/AGENTS.md` for user setup or `./AGENTS.md` for project setup) as the durable orchestration guidance layer; session-scoped AGENTS files only compose that durable guidance with runtime overlays and are not a replacement.
 
 Then work normally inside Codex:
@@ -156,6 +165,32 @@ created and recovered. `--worktree` also moves the launch into a separate git
 checkout, which is the safer default when using `--madmax`. Replace
 `feat/task` with a branch-like name for the task.
 
+### Concurrent standard conversations
+
+A standard launch owns one writable session pointer under its selected `OMX_ROOT`. A second ordinary `omx` launch from the same checkout therefore fails closed instead of sharing or silently changing that root. Give each additional conversation an explicit, distinct root:
+
+```bash
+omx
+OMX_ROOT="$HOME/.omx/instances/second-conversation" omx
+OMX_ROOT="$HOME/.omx/instances/third-conversation" omx
+```
+
+PowerShell:
+
+```powershell
+$env:OMX_ROOT = "$HOME/.omx/instances/second-conversation"
+omx
+```
+
+Command Prompt:
+
+```bat
+set "OMX_ROOT=%USERPROFILE%\.omx\instances\second-conversation"
+omx
+```
+
+User-specified roots are literal: launching twice with the same explicit `OMX_ROOT` remains a fatal owner conflict. Separate checkouts have separate default roots, while `--worktree` and `--madmax` keep their existing isolation behavior.
+
 ### Madmax and worktree launch safety
 
 `--madmax` is OMX shorthand for Codex
@@ -197,6 +232,8 @@ clean, commit, or stash that worktree before relying on it for isolation.
 
 For `omx team`, workers already use dedicated worktrees automatically by
 default; `--worktree` on `omx team` is only a legacy-compatible override.
+
+Repo-aware tools receive the same canonical context in launch, team-worker, and autoresearch runtimes: `OMX_REPO_ROOT`, `OMX_WORKTREE_ROOT`, `OMX_GIT_COMMON_DIR`, `OMX_WORKTREE_SCOPE`, `OMX_CODEGRAPH_MODE`, and `OMX_CODEGRAPH_PROJECT_PATH`. `OMX_CODEGRAPH_MODE=auto` prefers a worktree-local `.codegraph/codegraph.db`, then a leader/repo `.codegraph/codegraph.db`, otherwise resolves to `off`. Explicit `shared`, `local`, and `off` are honored. OMX does not install CodeGraph, auto-index worktrees, or copy/symlink `.codegraph`; shared leader indexes are useful for baseline navigation but are not branch-accurate for worktree-only changes.
 
 If you want a one-off launch with no OMX tmux/HUD management, use `--direct`:
 
@@ -299,10 +336,15 @@ Inside an Ultragoal story, use `$team` only when that story benefits from coordi
 | `$team "..."` | coordinated parallel execution when the work is big enough |
 | `/skills` | browsing installed skills and supporting helpers |
 | `/goal ...` | durable objective/checkpoint structure for tasks that must reconcile progress across turns |
+| `omx mission <file>` | sequential prompt/checklist batch runs through `omx exec`, with `.omx/missions/<slug>/summary.json` and `ledger.jsonl` operator artifacts |
 
 ## Advanced / operator surfaces
 
 These are useful, but they are not the main onboarding path.
+
+### Mission queue runner
+
+Use `omx mission` when you have a short checklist of OmX/Codex prompts that should run one after another instead of opening a separate shell command for each prompt. Start with `omx mission plan ./mission.md` or `omx mission ./mission.md --dry-run` to validate parsing and inspect the durable summary, then run `omx mission run ./mission.md -- --model gpt-5` when the prompts are ready. Interrupted runs can be inspected with `omx mission status ./mission.md`, continued with `omx mission resume ./mission.md`, operator-blocked with `omx mission mark ./mission.md --task task-002 --status blocked`, and repaired task-by-task with `omx mission rerun ./mission.md --task task-002`. See [`docs/mission.md`](./docs/mission.md) for input format, status output, and artifact details.
 
 ### Team runtime
 
@@ -326,11 +368,11 @@ These are operator/support surfaces:
 - Scoped setup installs prompts, skills, AGENTS scaffolding, `.codex/config.toml`, and (for legacy installs or older Codex without `plugin_hooks`) OMX-managed native Codex hooks in `.codex/hooks.json`
   - setup refresh preserves non-OMX hook entries in `.codex/hooks.json` and only rewrites OMX-managed wrappers
   - plugin setup keeps `AGENTS.md` as persistent durable guidance even though bundled skills/hooks come from the plugin cache; `omx doctor` treats a missing persistent scope `AGENTS.md` in plugin mode as a failed check because the session-scoped AGENTS file would otherwise contain only runtime overlay guidance
-  - `omx setup --scope project --merge-agents` preserves existing project `AGENTS.md` guidance while inserting or refreshing generated OMX sections between `<!-- OMX:AGENTS:START -->` / `<!-- OMX:AGENTS:END -->`; without `--merge-agents` or `--force`, non-interactive setup keeps skipping existing `AGENTS.md` files
+  - `omx setup --merge-agents` preserves existing project `AGENTS.md` guidance while inserting or refreshing generated OMX sections between `<!-- OMX:AGENTS:START -->` / `<!-- OMX:AGENTS:END -->`; `--no-merge-agents` records an explicit contextual non-merge choice, and `--clear-merge-agents-policy` always removes the recorded choice and cannot combine with a set selector. The policy is stored per working root (even for user scope), replayed by immediate and deferred updates only when its saved scope is valid and matches, and is never a force/default policy.
   - `omx uninstall` removes OMX-managed wrappers from `.codex/hooks.json` but keeps the file when user hooks remain
 - `omx update` checks npm immediately, installs the newest global OMX build, then reruns the same interactive setup refresh path
 - launch-time update checks are throttled and prompt by default; use `OMX_AUTO_UPDATE=0` to disable them or `OMX_AUTO_UPDATE=defer` to schedule deferred updates without a prompt
-- fresh OMX-managed `gpt-5.5` config seeding now recommends `model_context_window = 250000` and `model_auto_compact_token_limit = 200000`, but only when those keys are missing
+- fresh OMX-managed `gpt-5.6-sol` config seeding now recommends `model_context_window = 250000` and `model_auto_compact_token_limit = 200000`, but only when those keys are missing
 - `.omx-config.json` model/env routing is documented in [the model/env routing reference](./docs/reference/omx-config-schema-routing.md); only edit keys supported by your installed OMX version
 - `omx doctor` verifies the install when something seems wrong; it does not prove that the active Codex profile can make an authenticated model call
 - `omx hud --watch` is a monitoring/status surface, not the primary user workflow

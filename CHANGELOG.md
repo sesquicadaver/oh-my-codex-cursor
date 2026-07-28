@@ -4,6 +4,153 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.20.3] - 2026-07-19
+
+Patch release for the reliability and workflow-safety work in `v0.20.2..f967cfed64ec57614af136f75d7cb81509808f7e`, plus one additive, backward-compatible feature. No intentional breaking CLI or package-layout changes.
+
+### Added
+
+- **Max per-agent reasoning effort** — per-agent reasoning effort can be capped through the team model contract (#3143).
+
+### Fixed
+
+- **Team exact live-pane authority** — Team validates exact live tmux panes before applying explicit lifecycle effects, binds pane ownership through startup, scaling, rollback, recovery, and teardown, makes membership and scaling transactions durable and failure-atomic, and binds notify dispatch to the owning worker pane pid (#3153; issue #3121).
+- **Ralplan review integrity** — Ralplan requires strict direct review order (#3186), fails closed without documented leader proof (#3196; issue #3194), attests the reconciled leader in `PreToolUse` to close the live-exec regression (#3187; issue #3181), and resolves the App leader-proof regression by parsing collaboration results structurally (#3218; issue #3204).
+- **Team mailbox and session recovery** — mailbox wakeups are coalesced and every wake is acknowledged (#3217; issue #3195), and exact session pointer lock recovery is added (#3215; issue #3203).
+- **Native hook write identity** — native child write identity is hardened across the native hook, code-intel, and wiki MCP surfaces (#3135; issue #3127).
+- **Configuration trust tables** — the config generator reconciles duplicate project trust tables idempotently (#3201; issue #3199).
+- **Plugin hook responses** — the plugin native hook returns structured responses for oversized tool-hook payloads (#3211).
+- **Windows durability** — regular-file `fsync` `EPERM` is tolerated on Windows across hooks, uninstall, and the native hook (#3191).
+- **CLI documentation** — isolated standard launches are documented in the CLI and README (#3192).
+
+### Release collateral
+
+- `1c007fff`, `122b0cba`, `fb13a6db`, and `0a7baa81` are v0.20.2 post-publish evidence corrections carried forward; they are release-collateral inventory only.
+- `4b557d13` began 0.20.3 development and synchronized version metadata; it is release preparation, not a product headline.
+
+### PRs
+
+- #3135, #3143, #3153, #3186, #3187, #3191, #3192, #3196, #3201, #3211, #3215, #3217, #3218. Associated issues #3121, #3127, #3181, #3194, #3195, #3199, #3203, and #3204 are not additional PRs.
+
+### Verification
+
+- Pre-tag gate requirements and receipt locations are declared in `docs/qa/release-readiness-0.20.3.md`. This changelog asserts no CI run, tag, GitHub release, or npm publication result beyond what that record documents.
+
+## [0.20.2] - 2026-07-16
+
+Patch release for the reliability and workflow-safety work in `v0.20.1..f5e4753135ebc86342e7353300ac3ec5d9ae3d8d`. No intentional breaking CLI or package-layout changes.
+
+### Fixed
+
+- **Authenticated Ralplan bootstrap** — a fresh authenticated App leader can create a Ralplan role intent in-turn, with durable leader attestation, atomic single-flight intent recording, recovery, and fail-closed subagent/provenance checks (#3184; issue #3181).
+- **Native subagents and hooks** — App `spawn_agent` uses a surface-aware role contract; adapted role routing is transactionally bound to tracker evidence and markers, including crash recovery and cross-process lock-artifact cleanup (#3152, #3166; issue #3118). Recognized native subagents can stop without an unwanted automatic nudge (#3180).
+- **Workflow activation and terminal state** — workflow activation requires an explicit prompt-leading invocation, avoiding quoted, negated, documented, or malformed mentions (#3140; issue #3133); authenticated deep-interview terminal writes are accepted (#3179; issue #3177).
+- **Session, state, and notification isolation** — prompt session provenance is isolated across concurrent chats (#3168), fallback notification delivery is deduplicated across processes (#3165; issue #3162), canonical Ralplan session ownership rejects ambiguous aliases (#3158), and foreign stale workflow-transition mirrors are ignored (#3172).
+- **Setup and runtime environment** — setup persists an explicit root-local `AGENTS.md` merge policy across refreshes while retaining absence semantics and transient `--force` behavior (#3164; issue #3163); explicit Team worker policy is validated before tmux startup (#3136); detached panes retain their tmux-owned terminal environment (#3183; issue #3175); BOM-prefixed state input files are accepted (#3169).
+- **Hook-coordinate ownership** — setup, refresh, doctor, and uninstall preserve foreign Codex hook coordinates rather than claiming or removing them (#3151).
+
+### Changed
+
+- Updated `actions/setup-node` from 6 to 7 (#3154), TypeScript from 6.0.3 to 7.0.2 (#3155), `@types/node` from 26.1.0 to 26.1.1 (#3156), and `@biomejs/biome` from 2.5.2 to 2.5.3 (#3157).
+
+### Release collateral
+
+- #3129 reconciled 0.20.1 post-publish evidence. Its direct branch commit (`c628486896ffa8b9188335b91a76192571e32c9d`) and merge commit (`fce27bfd6c17c7665a6f1505b6b8384cc2c8edd5`) are release-collateral inventory only.
+- `29bdeb5c5670c133d9f2feda7512ee01e80a63d5` began 0.20.2 development and synchronized version metadata; it is release preparation, not a product headline.
+
+### PRs
+
+- #3129, #3136, #3140, #3151, #3152, #3154, #3155, #3156, #3157, #3158, #3164, #3165, #3166, #3168, #3169, #3172, #3179, #3180, #3183, #3184. Associated issues #3118, #3133, #3162, #3163, #3175, #3177, and #3181 are not additional PRs.
+
+### Verification
+
+- Pre-tag gate requirements and receipt locations are declared in `docs/qa/release-readiness-0.20.2.md`. This changelog asserts no local gate, review, CI run, tag, GitHub release, or npm publication result.
+
+## [0.20.1] - 2026-07-12
+
+Patch release for the reliability fixes in `v0.20.0..9eadab9f191103177fb3eac1b237188ada1f503c`. No intentional breaking CLI or package-layout changes.
+
+### Fixed
+
+- **CRLF AGENTS markers** — generated `AGENTS.md` marker insertion preserves CRLF line endings (#3107).
+- **Ralplan drafts** — the native planning-write boundary permits normalized direct-child Markdown artifacts under `.omx/drafts/` while retaining its fail-closed protections (#3110).
+- **Fresh configuration ownership** — setup no longer seeds legacy multi-agent or context-window defaults, preserving user-owned configuration and native role routing (#3111, #3115).
+- **Stop hook protocol** — Stop responses no longer emit unsupported top-level fields and remain schema-safe (#3114).
+- **Delegated child provenance** — the Conductor guard accepts trusted delegated collaboration children while continuing to protect leader and planning-boundary cases (#3117; issue #3116).
+- **Native delegation and Bash targets** — native delegation detection distinguishes incomplete capability inventories, and quoted Bash argument values no longer masquerade as write redirects (#3120; issue #3119).
+
+### Release collateral
+
+- `f644d2cd3ae98587942aa94f0030f083ea0bb10f` and `5d43a5bf6f008de17f9425bee4495c457c60b96a` are prior-release documentation corrections carried forward from 0.20.0 collateral; they are not 0.20.1 product-fix headlines.
+
+### PRs
+
+- #3107, #3110, #3111, #3114, #3115, #3117, #3120. Issues #3116 and #3119 are associated issues, not additional PRs.
+
+### Verification
+
+- Pre-tag requirements, evidence schema, and pending external evidence are declared in `docs/qa/release-readiness-0.20.1.md`; this changelog records no test, CI, tag, or publication result.
+## [0.20.0] - 2026-07-10
+
+Minor release migrating the entire model contract to OpenAI's GPT-5.6 generation (publicly released 2026-07-09), plus the accumulated dev-branch fixes and features merged since `0.19.1`.
+
+### Added
+
+- **Capabilities lockfile preflight** — new `omx capabilities lock`/`check` CLI providing a manual capabilities-lockfile preflight (#3087).
+- **GPT-5.6 model aliases** — `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6-sol` recognized as known Codex model aliases (#3104).
+- **Canonical worktree tool context** — shared CodeGraph/worktree tool-context resolution (#3102).
+- **Persisted subagents reopen on SessionStart** (#3099).
+
+### Changed
+
+- **Model contract migrated to GPT-5.6 (Sol/Terra/Luna)** — frontier default `gpt-5.5` -> `gpt-5.6-sol`, standard `gpt-5.4-mini` -> `gpt-5.6-terra`, spark `gpt-5.3-codex-spark` -> `gpt-5.6-luna` across runtime defaults, agent definitions, Rust crates (sparkshell/explore/api), docs, prompts, skills, plugin mirror, and test fixtures.
+- **Role allocation on the new lanes** — planner/architect pinned to exact `gpt-5.6-sol` (medium/xhigh reasoning), researcher pinned to exact `gpt-5.6-terra`; standard worker/review roles use `gpt-5.6-terra`; fast/low-complexity roles and team low-complexity workers use `gpt-5.6-luna`.
+- **Exact-model composition seam retargeted** — `EXACT_GPT_5_4_MINI_MODEL` renamed to `EXACT_GPT_5_6_TERRA_MODEL`; guidance keys off the trimmed final resolved model with exact case-sensitive equality and now takes precedence over role `exactModel` pins.
+- **Setup legacy upgrade set widened** — setup offers prompt-gated upgrades from both `gpt-5.3-codex` and `gpt-5.5` to `gpt-5.6-sol`; declined and non-interactive runs preserve the existing model.
+- **Autopilot cheap-lane classifier** — canonical `gpt-5.6-terra` and `gpt-5.6-luna` are classified as cheap ahead of the generic heuristic, so Terra mains route heavy planning to the dedicated planner.
+- **Project setup defaults to plugin mode with plugin cache** (#3085); plugin hooks are gated to omx-launched sessions (#3086); resume plugin preflight is opt-in (#3088).
+
+### Fixed
+
+- **Team delegation child-model fallback** resolves through `getTeamChildModel()` (honors `OMX_TEAM_CHILD_MODEL`) instead of a hardcoded seam constant.
+- **Doctor Spark source labeling** reports `.omx-config.json env` and `.omx-config.json models.team_low_complexity` accurately instead of misattributing sources.
+- **Conductor deadlock without native subagents prevented** (#3079); resume `--sort updated` preserves transcript mtimes (#3080); plugin Stop hook accepts last-line JSON after launcher noise (#3082).
+- **Deep-interview state hardening** — runtime state allowlist (#3091) and terminal-state normalization (#3092).
+- **Ralplan/Ultragoal handoff fixes** — approval handoff and lane reuse (#3094), ralplan-handoff goal derivation guard (#3097), structured ultragoal steering cleanup (#3100).
+
+### PRs
+
+- #3079, #3080, #3082, #3085, #3086, #3087, #3088, #3091, #3092, #3094, #3097, #3099, #3100, #3102, #3104
+
+## [0.19.1] - 2026-07-08
+
+Patch release after `0.19.0` focused on Ultragoal/Ralplan terminal-state reliability, direct Team state roots, mission queue execution, and dependency hygiene.
+
+### Added
+
+- Mission queue runner MVP (#3063).
+
+### Fixed
+
+- Repair Ultragoal conductor provenance and task-scoped aggregate completion state (#3074, #3072).
+- Handle invalid mission summary JSON (#3070).
+- Fix Ralplan terminalization tracker lag and terminal Stop cache loops (#3068, #3058).
+- Fix state roots for direct Team state directory usage (#3062).
+
+### Changed
+
+- Refresh @types/node to 26.1.0 and @biomejs/biome to 2.5.2 (#3065, #3066).
+- Avoid stale catalog counts in the contributing guide (#3069).
+
+### PRs
+
+- #3058, #3062, #3063, #3065, #3066, #3068, #3069, #3070, #3072, #3074
+
+### Verification
+
+- Dev CI is green for `59a9cb80`; release workflow evidence is appended after tag publication.
+
+
 ## [0.19.0] - 2026-07-04
 
 Reliability and safety-hardening train after `0.18.17`: planning-gate and handoff-artifact execution transports are locked down, the conductor contract and typed subagent/lane provenance are hardened, Ralplan consensus/terminal-state handling is tightened, madmax worktree and resume paths are fixed, and a long-standing parallel-test flake in the Rust suite is eliminated. The CLI/package/plugin contract is preserved.

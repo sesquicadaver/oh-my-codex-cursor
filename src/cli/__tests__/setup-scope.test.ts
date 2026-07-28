@@ -228,9 +228,10 @@ describe("omx setup scope behavior", () => {
       assert.equal(existsSync(agentsMdPath), true);
 
       const configToml = await readFile(localConfig, "utf-8");
-      assert.match(configToml, /^\[agents\]$/m);
-      assert.match(configToml, /^max_threads = 6$/m);
-      assert.match(configToml, /^max_depth = 2$/m);
+      assert.doesNotMatch(configToml, /^\[agents\]$/m);
+      assert.doesNotMatch(configToml, /^multi_agent\s*=/m);
+      assert.doesNotMatch(configToml, /^max_threads\s*=/m);
+      assert.doesNotMatch(configToml, /^max_depth\s*=/m);
       assert.doesNotMatch(configToml, /^\[env\]$/m);
       assert.match(configToml, /^\[shell_environment_policy\.set\]$/m);
       assert.match(configToml, /^USE_OMX_EXPLORE_CMD = "0"$/m);
@@ -274,6 +275,7 @@ describe("omx setup scope behavior", () => {
             hooks: {
               SessionStart: [
                 {
+                  matcher: "startup|resume|clear",
                   hooks: [
                     {
                       type: "command",
@@ -302,6 +304,17 @@ describe("omx setup scope behavior", () => {
       await writeFile(
         join(codexDir, "config.toml"),
         [
+          "[features]",
+          "multi_agent = false",
+          "custom_feature = true",
+          "",
+          "[agents]",
+          "max_threads = 17",
+          "max_depth = 5",
+          "",
+          "[agents.custom_role]",
+          'description = "keep me"',
+          "",
           "[hooks.state.\"custom:/hooks.json:stop:0:0\"]",
           "trusted_hash = \"sha256:user\"",
           "enabled = false",
@@ -309,9 +322,9 @@ describe("omx setup scope behavior", () => {
         ].join("\n"),
       );
 
-      const res = runOmx(wd, ["setup", "--scope", "project"], { HOME: home });
-      if (shouldSkipForSpawnPermissions(res.error)) return;
-      assert.equal(res.status, 0, res.stderr || res.stdout);
+      const setupResult = runOmx(wd, ["setup", "--scope", "project"], { HOME: home });
+      if (shouldSkipForSpawnPermissions(setupResult.error)) return;
+      assert.equal(setupResult.status, 0, setupResult.stderr || setupResult.stdout);
 
       const hooksJson = JSON.parse(
         await readFile(join(codexDir, "hooks.json"), "utf-8"),
@@ -350,6 +363,13 @@ describe("omx setup scope behavior", () => {
         configToml,
         /^\[hooks\.state\.".*\/\.codex\/hooks\.json:stop:0:0"\]$/m,
       );
+      assert.match(configToml, /^multi_agent = false$/m);
+      assert.match(configToml, /^custom_feature = true$/m);
+      assert.match(configToml, /^\[agents\]$/m);
+      assert.match(configToml, /^max_threads = 17$/m);
+      assert.match(configToml, /^max_depth = 5$/m);
+      assert.match(configToml, /^\[agents\.custom_role\]$/m);
+      assert.match(configToml, /^description = "keep me"$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -448,6 +468,11 @@ describe("omx setup scope behavior", () => {
         "utf-8",
       );
       assert.match(agentsMd, /~\/\.codex\/skills/);
+      const userConfigToml = await readFile(join(home, ".codex", "config.toml"), "utf-8");
+      assert.doesNotMatch(userConfigToml, /^multi_agent\s*=/m);
+      assert.doesNotMatch(userConfigToml, /^\[agents\]$/m);
+      assert.doesNotMatch(userConfigToml, /^max_threads\s*=/m);
+      assert.doesNotMatch(userConfigToml, /^max_depth\s*=/m);
       assert.equal(
         await readFile(join(wd, "AGENTS.md"), "utf-8"),
         existingAgents,
@@ -578,6 +603,50 @@ describe("omx setup scope behavior", () => {
         res.stdout,
         /Force mode: enabled additional destructive maintenance/,
       );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("omx setup merge policy CLI persistence", () => {
+  it("persists explicit true and false per project root without changing the default when absent", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-setup-merge-policy-"));
+    const otherRoot = await mkdtemp(join(tmpdir(), "omx-setup-merge-policy-other-"));
+    try {
+      const home = join(wd, "home");
+      await mkdir(home, { recursive: true });
+      for (const [root, flag, expected] of [
+        [wd, "--merge-agents", true],
+        [otherRoot, "--no-merge-agents", false],
+      ] as const) {
+        const result = runOmx(root, ["setup", "--scope", "user", flag], { HOME: home });
+        if (shouldSkipForSpawnPermissions(result.error)) return;
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const persisted = JSON.parse(await readFile(join(root, ".omx", "setup-scope.json"), "utf-8")) as { mergeAgents?: boolean };
+        assert.equal(persisted.mergeAgents, expected);
+      }
+      assert.notEqual(
+        await readFile(join(wd, ".omx", "setup-scope.json"), "utf-8"),
+        await readFile(join(otherRoot, ".omx", "setup-scope.json"), "utf-8"),
+        "roots retain independent merge policy records",
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(otherRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects conflicting merge selectors before setup creates state", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-setup-merge-policy-conflict-"));
+    try {
+      const home = join(wd, "home");
+      await mkdir(home, { recursive: true });
+      const result = runOmx(wd, ["setup", "--scope", "project", "--merge-agents", "--no-merge-agents"], { HOME: home });
+      if (shouldSkipForSpawnPermissions(result.error)) return;
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr || result.stdout, /Conflicting.*merge.*policy/i);
+      assert.equal(existsSync(join(wd, ".omx", "setup-scope.json")), false);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

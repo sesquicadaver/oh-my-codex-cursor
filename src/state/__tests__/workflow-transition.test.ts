@@ -234,6 +234,72 @@ describe('workflow transition rules', () => {
     });
   });
 
+  it('lets terminal Team detail outrank a foreign compatibility mirror without touching foreign state', async () => {
+    await withIsolatedStateEnv(async () => {
+      const wd = await mkdtemp(join(tmpdir(), 'omx-workflow-foreign-team-terminal-'));
+      try {
+        const stateDir = join(wd, '.omx', 'state');
+        await mkdir(stateDir, { recursive: true });
+        const teamState = { active: false, mode: 'team', current_phase: 'cancelled', run_outcome: 'continue' };
+        const skillState = {
+          version: 1,
+          active: true,
+          skill: 'team',
+          phase: 'team-exec',
+          current_phase: 'cancelled',
+          session_id: 'foreign-team-session',
+          active_skills: [{ skill: 'team', phase: 'team-exec', active: true }],
+        };
+        const runState = { version: 1, mode: 'team', active: true, outcome: 'continue', current_phase: 'team-exec' };
+        await writeFile(join(stateDir, 'team-state.json'), JSON.stringify(teamState, null, 2));
+        await writeFile(join(stateDir, 'skill-active-state.json'), JSON.stringify(skillState, null, 2));
+        await writeFile(join(stateDir, 'run-state.json'), JSON.stringify(runState, null, 2));
+
+        const transition = await reconcileWorkflowTransition(wd, 'deep-interview', {
+          action: 'write',
+          source: 'test',
+        });
+
+        assert.equal(transition.decision.allowed, true);
+        assert.deepEqual(transition.decision.currentModes, []);
+        assert.deepEqual(transition.completedPaths, []);
+        assert.deepEqual(JSON.parse(await readFile(join(stateDir, 'team-state.json'), 'utf-8')), teamState);
+        assert.deepEqual(JSON.parse(await readFile(join(stateDir, 'skill-active-state.json'), 'utf-8')), skillState);
+        assert.deepEqual(JSON.parse(await readFile(join(stateDir, 'run-state.json'), 'utf-8')), runState);
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('still rejects planning rollback when root Team detail is genuinely active', async () => {
+    await withIsolatedStateEnv(async () => {
+      const wd = await mkdtemp(join(tmpdir(), 'omx-workflow-foreign-team-active-'));
+      try {
+        const stateDir = join(wd, '.omx', 'state');
+        await mkdir(stateDir, { recursive: true });
+        await writeFile(join(stateDir, 'team-state.json'), JSON.stringify({
+          active: true,
+          mode: 'team',
+          current_phase: 'team-exec',
+        }, null, 2));
+        await writeFile(join(stateDir, 'skill-active-state.json'), JSON.stringify({
+          version: 1,
+          active: true,
+          skill: 'team',
+          session_id: 'foreign-team-session',
+          active_skills: [{ skill: 'team', phase: 'team-exec', active: true }],
+        }, null, 2));
+
+        await assert.rejects(
+          reconcileWorkflowTransition(wd, 'deep-interview', { action: 'write', source: 'test' }),
+          /team is already active/,
+        );
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    });
+  });
   it('co-locates auto-completed mode detail and canonical skill state under an explicit base state dir', async () => {
     const root = await mkdtemp(join(tmpdir(), 'omx-workflow-reconcile-base-dir-'));
     try {
@@ -251,6 +317,14 @@ describe('workflow transition rules', () => {
           deep_interview_gate: {
             status: 'complete',
             rationale: 'Requirements have been clarified and handed to ralplan.',
+          },
+          input_lock: {
+            active: true,
+            owner: 'handoff-question',
+          },
+          approval_lock: {
+            status: 'pending',
+            reviewer: 'user',
           },
         }, null, 2),
         'utf-8',
@@ -288,6 +362,12 @@ describe('workflow transition rules', () => {
       const boxedMode = JSON.parse(await readFile(boxedModePath, 'utf-8')) as Record<string, unknown>;
       assert.equal(boxedMode.active, false);
       assert.equal(boxedMode.current_phase, 'completed');
+      const boxedInputLock = boxedMode.input_lock as Record<string, unknown>;
+      const boxedApprovalLock = boxedMode.approval_lock as Record<string, unknown>;
+      assert.equal(boxedInputLock.active, false);
+      assert.equal(boxedInputLock.status, 'released');
+      assert.equal(boxedApprovalLock.active, false);
+      assert.equal(boxedApprovalLock.status, 'released');
 
       const boxedSkill = JSON.parse(await readFile(join(sessionDir, 'skill-active-state.json'), 'utf-8')) as Record<string, unknown>;
       assert.equal(boxedSkill.active, false);

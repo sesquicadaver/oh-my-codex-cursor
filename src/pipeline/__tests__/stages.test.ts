@@ -16,7 +16,7 @@ import { createUltraqaStage, buildUltraqaInstruction } from '../stages/ultraqa.j
 import { buildFollowupStaffingPlan } from '../../team/followup-planner.js';
 import { packageRoot } from '../../utils/paths.js';
 import { subagentTrackingPath } from '../../subagents/tracker.js';
-import { LEADER_CONDUCTOR_BLOCK } from '../../leader/contract.js';
+import { LEADER_CONDUCTOR_BLOCK, buildUnsupportedNativeSubagentGuidance } from '../../leader/contract.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -106,7 +106,10 @@ function decodeRuntimeCliInstructionPayload(instruction: string): Record<string,
 
 async function writeNativeSubagentTracking(cwd: string, sessionId: string): Promise<void> {
   const trackingPath = subagentTrackingPath(cwd);
-  const now = '2026-05-28T00:00:00.000Z';
+  const architectStart = '2026-05-28T00:00:00.000Z';
+  const architectDone = '2026-05-28T00:01:00.000Z';
+  const criticStart = '2026-05-28T00:02:00.000Z';
+  const criticDone = '2026-05-28T00:03:00.000Z';
   await mkdir(dirname(trackingPath), { recursive: true });
   await writeFile(trackingPath, JSON.stringify({
     schemaVersion: 1,
@@ -114,11 +117,11 @@ async function writeNativeSubagentTracking(cwd: string, sessionId: string): Prom
       [sessionId]: {
         session_id: sessionId,
         leader_thread_id: 'thread-leader',
-        updated_at: now,
+        updated_at: criticDone,
         threads: {
-          'thread-leader': { thread_id: 'thread-leader', kind: 'leader', first_seen_at: now, last_seen_at: now, turn_count: 1 },
-          'thread-architect': { thread_id: 'thread-architect', kind: 'subagent', first_seen_at: now, last_seen_at: now, completed_at: now, turn_count: 1 },
-          'thread-critic': { thread_id: 'thread-critic', kind: 'subagent', first_seen_at: now, last_seen_at: now, completed_at: now, turn_count: 1 },
+          'thread-leader': { thread_id: 'thread-leader', kind: 'leader', first_seen_at: architectStart, last_seen_at: criticDone, turn_count: 1 },
+          'thread-architect': { thread_id: 'thread-architect', kind: 'subagent', role: 'architect', mode: 'architect', first_seen_at: architectStart, last_seen_at: architectDone, completed_at: architectDone, turn_count: 1 },
+          'thread-critic': { thread_id: 'thread-critic', kind: 'subagent', role: 'critic', mode: 'critic', first_seen_at: criticStart, last_seen_at: criticDone, completed_at: criticDone, turn_count: 1 },
         },
       },
     },
@@ -192,8 +195,8 @@ describe('RALPLAN Stage', () => {
           ralplanConsensusGate: {
             complete: true,
             sequence: ['architect-review', 'critic-review'],
-            ralplan_architect_review: { agent_role: 'architect', verdict: 'approve' },
-            ralplan_critic_review: { agent_role: 'critic', verdict: 'approve' },
+            ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', sequence_index: 1 },
+            ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', sequence_index: 2 },
           },
         },
       },
@@ -216,8 +219,8 @@ describe('RALPLAN Stage', () => {
         ralplan: {
           ralplanConsensusGate: {
             complete: true,
-            ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', summary: 'architect approved' },
-            ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', summary: 'critic approved after architect' },
+            ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', sequence_index: 1, summary: 'architect approved' },
+            ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', sequence_index: 2, summary: 'critic approved after architect' },
           },
         },
       },
@@ -359,8 +362,8 @@ describe('RALPLAN Stage', () => {
     await writeFile(join(sessionDir, 'autopilot-state.json'), JSON.stringify({
       state: {
         handoff_artifacts: {
-          ralplan_architect_review: { agent_role: 'architect', verdict: 'approve' },
-          ralplan_critic_review: { agent_role: 'critic', verdict: 'approve' },
+          ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', sequence_index: 1 },
+          ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', sequence_index: 2 },
         },
       },
     }));
@@ -837,8 +840,8 @@ describe('RALPLAN Stage', () => {
     assert.deepEqual(artifacts.ralplanConsensusGate, {
       complete: true,
       sequence: ['architect-review', 'critic-review'],
-      ralplan_architect_review: { agent_role: 'architect', iteration: 1, verdict: 'approve', summary: 'architect ok' },
-      ralplan_critic_review: { agent_role: 'critic', iteration: 1, verdict: 'approve', summary: 'critic ok' },
+      ralplan_architect_review: { agent_role: 'architect', iteration: 1, sequence_index: 1, verdict: 'approve', summary: 'architect ok' },
+      ralplan_critic_review: { agent_role: 'critic', iteration: 1, sequence_index: 2, verdict: 'approve', summary: 'critic ok' },
       source: 'runtime-result',
       blockedReason: null,
     });
@@ -1938,6 +1941,35 @@ describe('Default Autopilot Ultragoal Stage Adapters', () => {
     assert.match(artifacts.team_condition as string, /Launch \$team only inside an active Ultragoal story/);
     assert.match(buildUltragoalInstruction('execute me'), /^\$ultragoal /);
     assert.match(buildUltragoalInstruction('execute me'), new RegExp(escapeRegExp(LEADER_CONDUCTOR_BLOCK)));
+    assert.doesNotMatch(buildUltragoalInstruction('execute me'), /Native subagent support is unavailable/);
+    assert.match(buildUltragoalInstruction('execute me', {
+      nativeSubagentSupport: { status: 'unknown', source: 'default_unknown' },
+    }), new RegExp(escapeRegExp(LEADER_CONDUCTOR_BLOCK)));
+    assert.match(buildUltragoalInstruction('execute me', {
+      nativeSubagentSupport: { status: 'supported', source: 'hook_payload_capability' },
+    }), new RegExp(escapeRegExp(LEADER_CONDUCTOR_BLOCK)));
+  });
+
+  it('emits unsupported native subagent guidance for explicit unsupported ultragoal evidence', async () => {
+    const nativeSubagentSupport = {
+      status: 'unsupported' as const,
+      reason: 'multi_agent_v1_unavailable' as const,
+      source: 'hook_payload_capability' as const,
+      evidenceSummary: 'multi_agent_v1 is absent',
+    };
+    const instruction = buildUltragoalInstruction('execute me', { nativeSubagentSupport });
+    assert.doesNotMatch(instruction, /Conductor mode contract:/);
+    assert.match(instruction, new RegExp(escapeRegExp(buildUnsupportedNativeSubagentGuidance(nativeSubagentSupport))));
+
+    const stage = createUltragoalStage();
+    const result = await stage.run(makeCtx({ artifacts: { ralplan: { native_subagent_support: nativeSubagentSupport } } }));
+    const artifacts = result.artifacts as Record<string, unknown>;
+    assert.doesNotMatch(artifacts.instruction as string, /Conductor mode contract:/);
+    assert.match(artifacts.instruction as string, /multi_agent_v1_unavailable/);
+
+    const forged = await stage.run(makeCtx({ artifacts: { ralplan: { native_subagent_support: { status: 'unsupported', reason: 'multi_agent_v1_unavailable' } } } }));
+    const forgedArtifacts = forged.artifacts as Record<string, unknown>;
+    assert.match(forgedArtifacts.instruction as string, /Conductor mode contract:/);
   });
 
   it('creates an ultraqa gate that fails closed without evidence and can record clean skips', async () => {

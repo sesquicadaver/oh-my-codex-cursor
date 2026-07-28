@@ -57,6 +57,44 @@ describe('CLI session-scoped state parity', () => {
     }
   });
 
+  it('does not mutate an unmatched implicit OMX session, including force cleanup', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-cancel-unmatched-session-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'canonical-session';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      const ralphPath = join(sessionDir, 'ralph-state.json');
+      const nativeStopPath = join(sessionDir, 'native-stop-state.json');
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeFile(ralphPath, JSON.stringify({ active: true, current_phase: 'executing' }));
+      await writeFile(nativeStopPath, JSON.stringify({
+        sessions: { [sessionId]: { last_signature: 'ralph-stop|pending' } },
+      }));
+
+      const cancelResult = runOmxWithEnv(
+        wd,
+        { OMX_SESSION_ID: 'unmatched-session' },
+        'cancel',
+        '--force',
+      );
+
+      assert.equal(cancelResult.status, 0, cancelResult.stderr || cancelResult.stdout);
+      assert.match(cancelResult.stderr, /OMX_SESSION_ID is not bound to session\.json/);
+      assert.match(cancelResult.stdout, /No active modes to cancel\./);
+      assert.deepEqual(
+        JSON.parse(await readFile(ralphPath, 'utf-8')),
+        { active: true, current_phase: 'executing' },
+      );
+      assert.deepEqual(
+        JSON.parse(await readFile(nativeStopPath, 'utf-8')),
+        { sessions: { [sessionId]: { last_signature: 'ralph-stop|pending' } } },
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('status does not report a root fallback mode as active after current-session clear', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-session-clear-fallback-'));
     try {
@@ -353,6 +391,76 @@ describe('CLI session-scoped state parity', () => {
       assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
       assert.match(statusResult.stdout, /No active modes\./);
       assert.doesNotMatch(statusResult.stdout, /STALE/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('reports durable failed Ultragoal artifacts without advertising a cancellable active mode', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-status-failed-ultragoal-'));
+    try {
+      const ultragoalDir = join(wd, '.omx', 'ultragoal');
+      await mkdir(ultragoalDir, { recursive: true });
+      await writeFile(join(ultragoalDir, 'goals.json'), JSON.stringify({
+        version: 1,
+        activeGoalId: 'G001-failed',
+        goals: [
+          {
+            id: 'G001-failed',
+            title: 'Failed story',
+            objective: 'Preserve failed evidence for retry.',
+            status: 'failed',
+          },
+        ],
+      }, null, 2));
+
+      const statusResult = runOmx(wd, 'status');
+      assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
+      assert.match(statusResult.stdout, /ultragoal: FAILED \(phase: failed\)/);
+      assert.doesNotMatch(statusResult.stdout, /ultragoal: ACTIVE \(phase: failed\)/);
+
+      const cancelResult = runOmx(wd, 'cancel');
+      assert.equal(cancelResult.status, 0, cancelResult.stderr || cancelResult.stdout);
+      assert.match(cancelResult.stdout, /No active modes to cancel\./);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves active Ultragoal mode status when durable failed artifacts coexist', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-status-active-ultragoal-failed-artifact-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'sess-active-ultragoal-failed-artifact';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      const ultragoalDir = join(wd, '.omx', 'ultragoal');
+      await mkdir(sessionDir, { recursive: true });
+      await mkdir(ultragoalDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeFile(join(sessionDir, 'ultragoal-state.json'), JSON.stringify({
+        active: true,
+        mode: 'ultragoal',
+        current_phase: 'executing',
+        session_id: sessionId,
+      }, null, 2));
+      await writeFile(join(ultragoalDir, 'goals.json'), JSON.stringify({
+        version: 1,
+        activeGoalId: 'G001-failed',
+        goals: [
+          {
+            id: 'G001-failed',
+            title: 'Failed story',
+            objective: 'Preserve failed evidence for retry.',
+            status: 'failed',
+          },
+        ],
+      }, null, 2));
+
+      const statusResult = runOmx(wd, 'status');
+      assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
+      assert.match(statusResult.stdout, /ultragoal: ACTIVE \(phase: executing\)/);
+      assert.doesNotMatch(statusResult.stdout, /ultragoal: FAILED \(phase: failed\)/);
+      assert.doesNotMatch(statusResult.stdout, /No active modes\./);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

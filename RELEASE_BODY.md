@@ -1,30 +1,38 @@
-# oh-my-codex 0.19.0
+# oh-my-codex 0.20.3
 
-> Release status: candidate. Publication proof is recorded in `docs/qa/release-readiness-0.19.0.md`; this body is finalized after dev/main CI, tag workflow, GitHub release, native asset, and npm publication evidence are complete.
-
-`0.19.0` is a reliability and safety-hardening release after `0.18.17`. It preserves the existing CLI/package/plugin contract while locking down planning-gate and handoff-artifact execution transports, hardening the conductor contract and typed subagent/lane provenance, tightening Ralplan consensus/terminal-state handling, fixing madmax worktree and resume paths, and eliminating a long-standing parallel-test flake in the Rust suite.
+`0.20.3` is a patch release for the reliability and workflow-safety work in the exact range `v0.20.2..f967cfed64ec57614af136f75d7cb81509808f7e`, plus one additive, backward-compatible feature.
 
 ## Highlights
 
-- Lock down planning-gate and handoff-artifact execution transports while still allowing legitimate deep-interview→ralplan artifact handoff.
-- Harden the conductor contract, typed subagent provenance, typed-lane fences, shell-guard target parsing, and conductor reuse ledger.
-- Tighten Ralplan consensus review evidence, terminal closeout state writes, and heredoc redirect scanning.
-- Fix Autopilot ralplan handoff, madmax worktree runtime roots, and madmax resume plugin cache preflight.
-- Render superseded Ultragoal goals correctly in the HUD.
-- Eliminate the intermittent Rust sparkshell test flake by making `unique_temp_dir()` collision-proof under parallel same-process execution.
+- Reasoning effort can be capped per agent through the team model contract (#3143).
+- Team validates exact live tmux panes before explicit lifecycle effects and preserves pane ownership through startup, scaling, rollback, recovery, and teardown, with durable failure-atomic membership/scaling transactions and pane-pid-bound notify dispatch (#3153; issue #3121).
+- Ralplan requires strict direct review order, fails closed without documented leader proof, attests the reconciled leader in `PreToolUse`, and resolves the App leader-proof regression by parsing collaboration results structurally (#3186, #3196, #3187, #3218; issues #3194, #3181, #3204).
+- Team mailbox wakeups are coalesced with every wake acknowledged (#3217; issue #3195), and exact session pointer lock recovery is added (#3215; issue #3203).
+- Native child write identity is hardened across the native hook, code-intel, and wiki MCP surfaces (#3135; issue #3127), and the configuration generator reconciles duplicate project trust tables idempotently (#3201; issue #3199).
+- The plugin native hook returns structured responses for oversized tool-hook payloads (#3211), and Windows regular-file `fsync` `EPERM` is tolerated across hooks, uninstall, and the native hook (#3191).
+
+## Additional fixes
+
+- Isolated standard launches are documented in the CLI and README (#3192).
+
+## Release collateral
+
+- `1c007fff`, `122b0cba`, `fb13a6db`, and `0a7baa81` are v0.20.2 post-publish evidence corrections carried forward; they are release-collateral inventory only. `4b557d13` is the 0.20.3 version-development preparation commit.
+
+## Merged PRs since v0.20.2
+
+#3135, #3143, #3153, #3186, #3187, #3191, #3192, #3196, #3201, #3211, #3215, #3217, #3218. Issues #3121, #3127, #3181, #3194, #3195, #3199, #3203, and #3204 are associated issues, not additional PRs.
 
 ## Compatibility
 
-No breaking CLI, package, plugin-layout, or configuration changes are intended.
+Patch release with no intentional breaking CLI or package-layout changes; the one feature (#3143) is additive and backward-compatible.
 
 ## Validation
 
-Release readiness evidence is recorded in `docs/qa/release-readiness-0.19.0.md`.
-
-Release-prep gates include version sync for `v0.19.0`, build, native-agent verification, plugin mirror/bundle checks, catalog docs check, the full Rust and node test suites (Rust rerun repeatedly to prove the flake fix), `npm pack --dry-run`, and `git diff --check`. Branch CI, dev/main promotion, tag-triggered release workflow, GitHub release proof, and npm publication proof are appended to readiness evidence after publication.
+Local build, lint, typecheck, plugin-bundle, native-agents, and Node test gates for the touched surface are recorded in `docs/qa/release-readiness-0.20.3.md`. External CI, tag, GitHub release, and npm provenance publication evidence is recorded in that same readiness record as the publish sequence completes.
 
 ## Contributors
 
-Thanks to the contributors who made this release possible.
+Thanks to Bellman (@Yeachan-Heo) for commits in this range.
 
-**Full Changelog**: [`v0.18.17...v0.19.0`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.18.17...v0.19.0)
+**Full Changelog**: [`v0.20.2...v0.20.3`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.20.2...v0.20.3)

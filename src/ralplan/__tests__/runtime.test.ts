@@ -5,7 +5,8 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { readModeState, startMode } from '../../modes/base.js';
-import { getStatePath } from '../../state/paths.js';
+import { getBaseStateDir, getStatePath } from '../../state/paths.js';
+import { writeRoleRoutingMarker } from '../../subagents/role-routing-marker.js';
 import { subagentTrackingPath } from '../../subagents/tracker.js';
 import { cancelRalplanConsensus, runRalplanConsensus } from '../runtime.js';
 
@@ -18,7 +19,9 @@ async function readScopedRalplanState(cwd: string, sessionId: string): Promise<R
 }
 
 async function writeNativeSubagentTracking(cwd: string, sessionId: string): Promise<void> {
-  const now = '2026-05-28T00:00:00.000Z';
+  const architectCompletedAt = '2026-05-28T00:00:00.000Z';
+  const criticStartedAt = '2026-05-28T00:05:00.000Z';
+  const criticCompletedAt = '2026-05-28T00:10:00.000Z';
   const trackingPath = subagentTrackingPath(cwd);
   await mkdir(join(trackingPath, '..'), { recursive: true });
   await writeFile(trackingPath, JSON.stringify({
@@ -27,35 +30,76 @@ async function writeNativeSubagentTracking(cwd: string, sessionId: string): Prom
       [sessionId]: {
         session_id: sessionId,
         leader_thread_id: 'thread-leader',
-        updated_at: now,
+        updated_at: criticCompletedAt,
         threads: {
           'thread-leader': {
             thread_id: 'thread-leader',
             kind: 'leader',
-            first_seen_at: now,
-            last_seen_at: now,
+            first_seen_at: architectCompletedAt,
+            last_seen_at: architectCompletedAt,
             turn_count: 1,
           },
           'thread-architect': {
             thread_id: 'thread-architect',
             kind: 'subagent',
-            first_seen_at: now,
-            last_seen_at: now,
-            completed_at: now,
+            first_seen_at: architectCompletedAt,
+            last_seen_at: architectCompletedAt,
+            completed_at: architectCompletedAt,
             turn_count: 1,
+            role: 'architect',
           },
           'thread-critic': {
             thread_id: 'thread-critic',
             kind: 'subagent',
-            first_seen_at: now,
-            last_seen_at: now,
-            completed_at: now,
+            first_seen_at: criticStartedAt,
+            last_seen_at: criticCompletedAt,
+            completed_at: criticCompletedAt,
             turn_count: 1,
+            role: 'critic',
           },
         },
       },
     },
   }, null, 2));
+}
+
+async function writeAdaptedSubagentTracking(cwd: string, sessionId: string): Promise<void> {
+  await writeNativeSubagentTracking(cwd, sessionId);
+  const trackingPath = subagentTrackingPath(cwd);
+  const tracking = JSON.parse(await readFile(trackingPath, 'utf-8')) as {
+    sessions: Record<string, { threads: Record<string, Record<string, unknown>> }>;
+  };
+  const threads = tracking.sessions[sessionId]?.threads;
+  if (!threads) throw new Error('adapted_subagent_tracking_fixture_missing');
+  for (const [threadId, role] of [['thread-architect', 'architect'], ['thread-critic', 'critic']] as const) {
+    threads[threadId] = {
+      ...threads[threadId],
+      role,
+      provenance_kind: 'omx_adapted',
+    };
+  }
+  threads['thread-architect'] = {
+    ...threads['thread-architect'],
+    first_seen_at: '2026-05-28T00:00:00.000Z',
+    last_seen_at: '2026-05-28T00:00:00.000Z',
+    completed_at: '2026-05-28T00:00:00.000Z',
+  };
+  threads['thread-critic'] = {
+    ...threads['thread-critic'],
+    first_seen_at: '2026-05-28T00:05:00.000Z',
+    last_seen_at: '2026-05-28T00:05:00.000Z',
+    completed_at: '2026-05-28T00:05:00.000Z',
+  };
+  await writeFile(trackingPath, JSON.stringify(tracking, null, 2));
+  writeRoleRoutingMarker(getBaseStateDir(cwd), {
+    schema_version: 1,
+    cwd,
+    session_id: sessionId,
+    parent_thread_id: 'thread-leader',
+    observed_at: '2026-07-13T10:00:00.000Z',
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    evidence: 'OMX adapted role intent consumed for native child SessionStart',
+  });
 }
 
 describe('ralplan runtime', () => {
@@ -145,6 +189,7 @@ describe('ralplan runtime', () => {
         ralplan_architect_review: {
           agent_role: 'architect',
           iteration: 1,
+          sequence_index: 1,
           verdict: 'approve',
           summary: 'architect-ok',
           artifacts: { architected: true },
@@ -152,6 +197,7 @@ describe('ralplan runtime', () => {
         ralplan_critic_review: {
           agent_role: 'critic',
           iteration: 1,
+          sequence_index: 2,
           verdict: 'approve',
           summary: 'critic-ok',
           artifacts: { critiqued: true },
@@ -159,6 +205,7 @@ describe('ralplan runtime', () => {
         architect_review: {
           agent_role: 'architect',
           iteration: 1,
+          sequence_index: 1,
           verdict: 'approve',
           summary: 'architect-ok',
           artifacts: { architected: true },
@@ -166,6 +213,7 @@ describe('ralplan runtime', () => {
         critic_review: {
           agent_role: 'critic',
           iteration: 1,
+          sequence_index: 2,
           verdict: 'approve',
           summary: 'critic-ok',
           artifacts: { critiqued: true },
@@ -173,6 +221,142 @@ describe('ralplan runtime', () => {
         blocked_reason: null,
       });
       assert.equal(Array.isArray(finalState?.review_history), true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('records planning-only terminal state when consensus approves without a selected execution lane', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-planning-only-'));
+    try {
+      const result = await runRalplanConsensus({
+        async draft() {
+          const plansDir = join(cwd, '.omx', 'plans');
+          await mkdir(plansDir, { recursive: true });
+          const prdPath = join(plansDir, 'prd-planning-only.md');
+          await writeFile(prdPath, '# plan\n');
+          await writeFile(join(plansDir, 'test-spec-planning-only.md'), '# tests\n');
+          return { summary: 'draft', planPath: prdPath };
+        },
+        async architectReview() {
+          return { verdict: 'approve', summary: 'architect ok' };
+        },
+        async criticReview() {
+          return { verdict: 'approve', summary: 'critic ok' };
+        },
+      }, { task: 'planning only approval', cwd, maxIterations: 1 });
+
+      assert.equal(result.status, 'completed');
+      assert.equal(result.executionHandoffStarted, false);
+      const finalState = await readModeState('ralplan', cwd);
+      const ralplanHandoff = (finalState?.handoff_artifacts as { ralplan?: Record<string, unknown> } | undefined)?.ralplan;
+      assert.equal(finalState?.selected_execution_lane, 'none');
+      assert.equal(ralplanHandoff?.execution_handoff_status, 'planning_only_terminal');
+      assert.equal(ralplanHandoff?.planning_only_terminal, true);
+      assert.equal(existsSync(getStatePath('ultragoal', cwd)), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('starts the selected execution handoff only after Critic approval completes consensus', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-execution-handoff-'));
+    try {
+      const result = await runRalplanConsensus({
+        async draft() {
+          const plansDir = join(cwd, '.omx', 'plans');
+          await mkdir(plansDir, { recursive: true });
+          const prdPath = join(plansDir, 'prd-handoff.md');
+          await writeFile(prdPath, '# plan\n');
+          await writeFile(join(plansDir, 'test-spec-handoff.md'), '# tests\n');
+          return { summary: 'draft', planPath: prdPath };
+        },
+        async architectReview() {
+          assert.equal(existsSync(getStatePath('ultragoal', cwd)), false);
+          return { verdict: 'approve', summary: 'architect ok' };
+        },
+        async criticReview() {
+          assert.equal(existsSync(getStatePath('ultragoal', cwd)), false);
+          return { verdict: 'approve', summary: 'critic ok' };
+        },
+      }, { task: 'approval starts ultragoal', cwd, maxIterations: 1, selectedExecutionLane: 'ultragoal' });
+
+      assert.equal(result.status, 'completed');
+      assert.equal(result.executionHandoffStarted, true);
+      const ultragoalState = JSON.parse(await readFile(getStatePath('ultragoal', cwd), 'utf-8')) as Record<string, unknown>;
+      assert.equal(ultragoalState.active, true);
+      assert.equal(ultragoalState.current_phase, 'starting');
+      const finalState = await readModeState('ralplan', cwd);
+      const ralplanHandoff = (finalState?.handoff_artifacts as { ralplan?: Record<string, unknown> } | undefined)?.ralplan;
+      assert.equal(ralplanHandoff?.selected_execution_lane, 'ultragoal');
+      assert.equal(ralplanHandoff?.execution_handoff_status, 'started');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('passes and enforces reusable Architect lane on re-review iterations', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-architect-reuse-'));
+    try {
+      const architectThreads: Array<string | undefined> = [];
+      const result = await runRalplanConsensus({
+        async draft(ctx) {
+          const plansDir = join(cwd, '.omx', 'plans');
+          await mkdir(plansDir, { recursive: true });
+          const prdPath = join(plansDir, 'prd-reuse.md');
+          await writeFile(prdPath, '# plan\n');
+          await writeFile(join(plansDir, 'test-spec-reuse.md'), '# tests\n');
+          return { summary: `draft-${ctx.iteration}`, planPath: prdPath };
+        },
+        async architectReview(ctx) {
+          architectThreads.push(ctx.reusableRoleLanes.architect?.thread_id);
+          return {
+            verdict: 'approve',
+            summary: `architect-${ctx.iteration}`,
+            agent_role: 'architect',
+            thread_id: ctx.reusableRoleLanes.architect?.thread_id ?? 'thread-architect',
+          };
+        },
+        async criticReview(ctx) {
+          return { verdict: ctx.iteration === 1 ? 'iterate' : 'approve', summary: `critic-${ctx.iteration}` };
+        },
+      }, { task: 'reuse architect lane', cwd, maxIterations: 3 });
+
+      assert.equal(result.status, 'completed');
+      assert.deepEqual(architectThreads, [undefined, 'thread-architect']);
+      assert.deepEqual(result.architectReviews.map((review) => review.thread_id), ['thread-architect', 'thread-architect']);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when a re-review Architect pass spawns a fresh lane without a new-lane reason', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-architect-reuse-deny-'));
+    try {
+      const result = await runRalplanConsensus({
+        async draft(ctx) {
+          const plansDir = join(cwd, '.omx', 'plans');
+          await mkdir(plansDir, { recursive: true });
+          const prdPath = join(plansDir, 'prd-reuse-deny.md');
+          await writeFile(prdPath, '# plan\n');
+          await writeFile(join(plansDir, 'test-spec-reuse-deny.md'), '# tests\n');
+          return { summary: `draft-${ctx.iteration}`, planPath: prdPath };
+        },
+        async architectReview(ctx) {
+          return {
+            verdict: 'approve',
+            summary: `architect-${ctx.iteration}`,
+            agent_role: 'architect',
+            thread_id: ctx.iteration === 1 ? 'thread-architect-1' : 'thread-architect-2',
+          };
+        },
+        async criticReview(ctx) {
+          return { verdict: ctx.iteration === 1 ? 'iterate' : 'approve', summary: `critic-${ctx.iteration}` };
+        },
+      }, { task: 'reject fresh architect lane', cwd, maxIterations: 3 });
+
+      assert.equal(result.status, 'failed');
+      assert.match(result.error || '', /ralplan_architect_lane_reuse_required/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -320,7 +504,8 @@ describe('ralplan runtime', () => {
   it('preserves existing tracker completion for review threads without native-required mode', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-preserve-completion-'));
     const sessionId = 'sess-ralplan-preserve-completion';
-    const completedAt = '2026-05-28T00:00:00.000Z';
+    const architectCompletedAt = '2026-05-28T00:00:00.000Z';
+    const criticCompletedAt = '2026-05-28T00:10:00.000Z';
     try {
       await mkdir(join(sessionStatePath(cwd, sessionId), '..'), { recursive: true });
       await writeFile(join(sessionStatePath(cwd, sessionId), '..', '..', '..', 'session.json'), JSON.stringify({ session_id: sessionId }));
@@ -362,8 +547,8 @@ describe('ralplan runtime', () => {
       const tracking = JSON.parse(await readFile(subagentTrackingPath(cwd), 'utf-8')) as {
         sessions?: Record<string, { threads?: Record<string, { completed_at?: string }> }>;
       };
-      assert.equal(tracking.sessions?.[sessionId]?.threads?.['thread-architect']?.completed_at, completedAt);
-      assert.equal(tracking.sessions?.[sessionId]?.threads?.['thread-critic']?.completed_at, completedAt);
+      assert.equal(tracking.sessions?.[sessionId]?.threads?.['thread-architect']?.completed_at, architectCompletedAt);
+      assert.equal(tracking.sessions?.[sessionId]?.threads?.['thread-critic']?.completed_at, criticCompletedAt);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -493,6 +678,63 @@ describe('ralplan runtime', () => {
     }
   });
 
+
+  it('rejects Autopilot-required consensus with legacy OMX-adapted Architect and Critic lanes', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-adapted-required-ok-'));
+    const sessionId = 'sess-ralplan-adapted-required-ok';
+    try {
+      await mkdir(join(sessionStatePath(cwd, sessionId), '..'), { recursive: true });
+      await writeFile(join(sessionStatePath(cwd, sessionId), '..', '..', '..', 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeAdaptedSubagentTracking(cwd, sessionId);
+
+      const result = await runRalplanConsensus({
+        async draft() {
+          const plansDir = join(cwd, '.omx', 'plans');
+          await mkdir(plansDir, { recursive: true });
+          const prdPath = join(plansDir, 'prd-adapted-ok.md');
+          await writeFile(prdPath, '# plan\n');
+          await writeFile(join(plansDir, 'test-spec-adapted-ok.md'), '# tests\n');
+          return { summary: 'draft', planPath: prdPath };
+        },
+        async architectReview() {
+          return {
+            verdict: 'approve',
+            summary: 'adapted architect ok',
+            provenance_kind: 'omx_adapted',
+            session_id: sessionId,
+            thread_id: 'thread-architect',
+            artifact_path: '.omx/artifacts/architect.md',
+            agent_role: 'architect',
+            tracker_path: '.omx/state/subagent-tracking.json',
+          };
+        },
+        async criticReview() {
+          return {
+            verdict: 'approve',
+            summary: 'adapted critic ok',
+            provenance_kind: 'omx_adapted',
+            session_id: sessionId,
+            thread_id: 'thread-critic',
+            artifact_path: '.omx/artifacts/critic.md',
+            agent_role: 'critic',
+            tracker_path: '.omx/state/subagent-tracking.json',
+          };
+        },
+      }, {
+        task: 'require adapted reviews',
+        cwd,
+        sessionId,
+        maxIterations: 1,
+        requireNativeSubagents: true,
+      });
+
+      assert.equal(result.status, 'failed');
+      assert.equal(result.ralplanConsensusGate.complete, false);
+      assert.equal(result.ralplanConsensusGate.blocked_reason, 'native_subagent_consensus_evidence_missing');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 
   it('fails Autopilot-required consensus when native reviews reuse one subagent thread', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-native-same-thread-'));

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'fs/promises';
+
 import { existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve as resolvePath } from 'path';
@@ -8,19 +9,24 @@ import {
   getAllScopedStateDirs,
   getAllScopedStatePaths,
   getBaseStateDir,
+  getBaseStateDirWithSource,
   getAllSessionScopedStateDirs,
   getAllSessionScopedStatePaths,
   getReadScopedStateFilePaths,
   readCurrentSessionId,
   resolveRuntimeStateScope,
   resolveStateScope,
+  resolveWritableStateScope,
   resolveWorkingDirectoryForState,
   getStateDir,
   getStateFilePath,
   getStatePath,
+  normalizeSessionId,
   validateStateFileName,
   validateStateModeSegment,
   validateSessionId,
+  WRITABLE_STATE_SCOPE_ERRORS,
+
 } from '../state-paths.js';
 
 
@@ -32,7 +38,10 @@ const isolatedEnvKeys = [
   'OMX_SESSION_ID',
   'CODEX_SESSION_ID',
   'SESSION_ID',
+  'TMUX',
+  'TMUX_PANE',
 ] as const;
+
 const originalEnv = Object.fromEntries(
   isolatedEnvKeys.map((key) => [key, process.env[key]]),
 ) as Record<(typeof isolatedEnvKeys)[number], string | undefined>;
@@ -65,6 +74,14 @@ describe('validateSessionId', () => {
     assert.throws(() => validateSessionId(123), /session_id must be a string/);
   });
 });
+describe('normalizeSessionId', () => {
+  it('normalizes usable values without throwing on unusable input', () => {
+    assert.equal(normalizeSessionId(' sess-normalized '), 'sess-normalized');
+    assert.equal(normalizeSessionId('bad/session'), undefined);
+    assert.equal(normalizeSessionId(123), undefined);
+  });
+});
+
 
 describe('validateStateModeSegment', () => {
   it('accepts safe mode names', () => {
@@ -104,6 +121,10 @@ describe('state paths', () => {
       assert.equal(getBaseStateDir('/tmp/source'), '/tmp/explicit-team-state');
       assert.equal(getStateDir('/tmp/source', 'sess1'), '/tmp/explicit-team-state/sessions/sess1');
       assert.equal(getStatePath('ralph', '/tmp/source', 'sess1'), '/tmp/explicit-team-state/sessions/sess1/ralph-state.json');
+      assert.deepEqual(getBaseStateDirWithSource('/tmp/source'), {
+        baseStateDir: '/tmp/explicit-team-state',
+        rootSource: 'team-env',
+      });
     } finally {
       if (typeof prevRoot === 'string') process.env.OMX_ROOT = prevRoot;
       else delete process.env.OMX_ROOT;
@@ -125,6 +146,10 @@ describe('state paths', () => {
       assert.equal(getBaseStateDir('/tmp/source'), '/tmp/omx-box/.omx/state');
       assert.equal(getStateDir('/tmp/source', 'sess1'), '/tmp/omx-box/.omx/state/sessions/sess1');
       assert.equal(getStatePath('ralph', '/tmp/source', 'sess1'), '/tmp/omx-box/.omx/state/sessions/sess1/ralph-state.json');
+      assert.deepEqual(getBaseStateDirWithSource('/tmp/source'), {
+        baseStateDir: '/tmp/omx-box/.omx/state',
+        rootSource: 'omx-root-env',
+      });
     } finally {
       if (typeof prevRoot === 'string') process.env.OMX_ROOT = prevRoot;
       else delete process.env.OMX_ROOT;
@@ -132,6 +157,28 @@ describe('state paths', () => {
       else delete process.env.OMX_STATE_ROOT;
       if (typeof prevTeamRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = prevTeamRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
+    }
+  });
+
+  it('fails closed when an explicit state root is outside the allowlist', async () => {
+    const allowedRoot = await mkRealTemp('omx-state-root-allowed-');
+    const disallowedRoot = await mkRealTemp('omx-state-root-disallowed-');
+    const prevAllowlist = process.env.OMX_MCP_WORKDIR_ROOTS;
+    const prevTeamRoot = process.env.OMX_TEAM_STATE_ROOT;
+    process.env.OMX_MCP_WORKDIR_ROOTS = allowedRoot;
+    process.env.OMX_TEAM_STATE_ROOT = disallowedRoot;
+    try {
+      assert.throws(
+        () => getBaseStateDirWithSource(join(allowedRoot, 'workspace')),
+        /outside allowed roots \(OMX_MCP_WORKDIR_ROOTS\)/,
+      );
+    } finally {
+      if (typeof prevAllowlist === 'string') process.env.OMX_MCP_WORKDIR_ROOTS = prevAllowlist;
+      else delete process.env.OMX_MCP_WORKDIR_ROOTS;
+      if (typeof prevTeamRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = prevTeamRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
+      await rm(allowedRoot, { recursive: true, force: true });
+      await rm(disallowedRoot, { recursive: true, force: true });
     }
   });
 
@@ -558,4 +605,104 @@ describe('state paths', () => {
       await rm(wd, { recursive: true, force: true });
     }
   });
+  describe('writable state scope', () => {
+    it('uses root only when session.json is absent and ignores compatibility-only environment aliases', async () => {
+      const wd = await mkRealTemp('omx-writable-root-');
+      try {
+        process.env.CODEX_SESSION_ID = 'compat-read-session';
+
+        const scope = await resolveWritableStateScope(wd);
+        assert.deepEqual(scope, {
+          source: 'root',
+          stateDir: getBaseStateDir(wd),
+        });
+        assert.equal(existsSync(join(wd, '.omx', 'state')), false);
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    });
+
+    it('uses a usable canonical session.json scope and rejects a present unusable session.json', async () => {
+      const wd = await mkRealTemp('omx-writable-session-');
+      try {
+        const stateDir = getBaseStateDir(wd);
+        await mkdir(stateDir, { recursive: true });
+        await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+          session_id: 'sess-canonical',
+          cwd: wd,
+        }));
+
+        assert.deepEqual(await resolveWritableStateScope(wd), {
+          source: 'session',
+          sessionId: 'sess-canonical',
+          stateDir: join(stateDir, 'sessions', 'sess-canonical'),
+        });
+
+        await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+          session_id: 'sess-unusable',
+          cwd: join(wd, 'other-worktree'),
+        }));
+        await assert.rejects(
+          () => resolveWritableStateScope(wd),
+          (error: unknown) => {
+            assert.equal((error as Error).message, WRITABLE_STATE_SCOPE_ERRORS.unusableSession);
+            return true;
+          },
+        );
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    });
+
+    it('fails closed for an unmatched OMX_SESSION_ID while preserving explicit fork scope', async () => {
+      const wd = await mkRealTemp('omx-writable-unmatched-env-');
+      try {
+        const stateDir = getBaseStateDir(wd);
+        await mkdir(stateDir, { recursive: true });
+        await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: 'sess-canonical', cwd: wd }));
+        process.env.OMX_SESSION_ID = 'sess-unmatched';
+
+        await assert.rejects(
+          () => resolveWritableStateScope(wd),
+          (error: unknown) => {
+            assert.equal((error as Error).message, WRITABLE_STATE_SCOPE_ERRORS.unboundEnvironment);
+            return true;
+          },
+        );
+        assert.equal(existsSync(join(stateDir, 'sessions', 'sess-unmatched')), false);
+
+        assert.deepEqual(await resolveWritableStateScope(wd, 'explicit-fork'), {
+          source: 'explicit',
+          sessionId: 'explicit-fork',
+          stateDir: join(stateDir, 'sessions', 'explicit-fork'),
+        });
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    });
+
+    it('maps a persisted OMX owner alias to the canonical writable session without re-proving tmux evidence', async () => {
+      const wd = await mkRealTemp('omx-writable-alias-');
+      try {
+        const stateDir = getBaseStateDir(wd);
+        await mkdir(stateDir, { recursive: true });
+        await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+          session_id: 'sess-canonical',
+          native_session_id: 'native-alias',
+          owner_omx_session_id: 'omx-owner-alias',
+          cwd: wd,
+        }));
+        process.env.OMX_SESSION_ID = 'omx-owner-alias';
+
+        assert.deepEqual(await resolveWritableStateScope(wd), {
+          source: 'session',
+          sessionId: 'sess-canonical',
+          stateDir: join(stateDir, 'sessions', 'sess-canonical'),
+        });
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    });
+  });
+
 });
