@@ -1,38 +1,25 @@
-# oh-my-codex 0.20.3
+# oh-my-codex 0.20.5
 
-`0.20.3` is a patch release for the reliability and workflow-safety work in the exact range `v0.20.2..f967cfed64ec57614af136f75d7cb81509808f7e`, plus one additive, backward-compatible feature.
+`0.20.5` is a patch release for the exact range `v0.20.4..13c08f84cb6c27750b8f5c4a4d5105faad074196` (68 commits, 35 merged PRs). It contains no intentional breaking CLI or package-layout changes.
 
 ## Highlights
 
-- Reasoning effort can be capped per agent through the team model contract (#3143).
-- Team validates exact live tmux panes before explicit lifecycle effects and preserves pane ownership through startup, scaling, rollback, recovery, and teardown, with durable failure-atomic membership/scaling transactions and pane-pid-bound notify dispatch (#3153; issue #3121).
-- Ralplan requires strict direct review order, fails closed without documented leader proof, attests the reconciled leader in `PreToolUse`, and resolves the App leader-proof regression by parsing collaboration results structurally (#3186, #3196, #3187, #3218; issues #3194, #3181, #3204).
-- Team mailbox wakeups are coalesced with every wake acknowledged (#3217; issue #3195), and exact session pointer lock recovery is added (#3215; issue #3203).
-- Native child write identity is hardened across the native hook, code-intel, and wiki MCP surfaces (#3135; issue #3127), and the configuration generator reconciles duplicate project trust tables idempotently (#3201; issue #3199).
-- The plugin native hook returns structured responses for oversized tool-hook payloads (#3211), and Windows regular-file `fsync` `EPERM` is tolerated across hooks, uninstall, and the native hook (#3191).
+- **Darwin detached return-to-shell and finalization** — detached launches now bind readiness and metadata to the live pane, retain exact HUD/leader authority through teardown, release attach only after finalization, and exercise the return-to-shell path on macOS (#3472).
+- **Session and hook authority** — exact indeterminate bindings are finalized with synchronous directory-capability revalidation; trusted lock inspection is available for diagnostics; identity-indeterminate Stop handling is silent; authorization failures are no longer reinjected (#3416, #3421, #3471, #3472).
+- **Ralplan diagnostics and lifecycle** — preflight remains state-preserving, reports structured detected-version diagnostics, clears stale owner-scoped state, permits typed consensus delegation, and recognizes Codex 0.148 alpha versions (#3450, #3455, #3456, #3473).
+- **Windows and setup durability** — directory `fsync` `EPERM`, hook mode synthesis, and mode read-back are tolerated on Windows; launch repair preserves user notify/reasoning settings and project scope (#3448, #3449, #3467, #3468).
+- **Team/tmux boundaries** — foreign pane topology is explained rather than claimed, and source-authority separator argv boundaries are preserved (#3434, #3460).
+- **Plugin/runtime and packed-install fixes** — packed runtime provisioning and cwd checks are deterministic, ambient session state is scrubbed, detached OMX state is bound to launch context, and Doctor validates native process-identity readiness (#3395, #3436, #3454, #3461, #3470).
+- **Dependencies** — `windows-sys` 0.59→0.61.2, `tar-stream` 2.2.0→3.2.0, `@types/tar-stream` 2.2.3→3.1.4, `@biomejs/biome` 2.5.4→2.5.6, and `@types/node` 26.1.1→26.1.2 (#3429–#3432).
 
-## Additional fixes
-
-- Isolated standard launches are documented in the CLI and README (#3192).
-
-## Release collateral
-
-- `1c007fff`, `122b0cba`, `fb13a6db`, and `0a7baa81` are v0.20.2 post-publish evidence corrections carried forward; they are release-collateral inventory only. `4b557d13` is the 0.20.3 version-development preparation commit.
-
-## Merged PRs since v0.20.2
-
-#3135, #3143, #3153, #3186, #3187, #3191, #3192, #3196, #3201, #3211, #3215, #3217, #3218. Issues #3121, #3127, #3181, #3194, #3195, #3199, #3203, and #3204 are associated issues, not additional PRs.
+> **Current status / supersession (ADR 3212):** Local leader attestation and adapted role intent do not authorize. Typed routing and tracker evidence are lifecycle or diagnostic evidence only. When `role_routing_unavailable` applies to an adapted Ralplan authority attempt, installed role-intent and preflight fail closed with `unsupported_documented_leader_proof`. Ralplan consensus remains unavailable with `documented_host_consensus_receipt_unavailable` because no official host receipt verifier exists; native Architect/Critic evidence alone cannot release the transition.
 
 ## Compatibility
 
-Patch release with no intentional breaking CLI or package-layout changes; the one feature (#3143) is additive and backward-compatible.
-
-## Validation
-
-Local build, lint, typecheck, plugin-bundle, native-agents, and Node test gates for the touched surface are recorded in `docs/qa/release-readiness-0.20.3.md`. External CI, tag, GitHub release, and npm provenance publication evidence is recorded in that same readiness record as the publish sequence completes.
+Patch release with no intentional breaking contract. Publication, tag, GitHub Release, and npm availability remain pending the owner-authorized promotion lane.
 
 ## Contributors
 
-Thanks to Bellman (@Yeachan-Heo) for commits in this range.
+Thanks to Bellman (@Yeachan-Heo) for the majority of commits in this range, with an additional contribution from @ev78394, plus @app/dependabot for dependency updates.
 
-**Full Changelog**: [`v0.20.2...v0.20.3`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.20.2...v0.20.3)
+**Full Changelog**: [`v0.20.4...v0.20.5`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.20.4...v0.20.5)

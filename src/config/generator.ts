@@ -32,7 +32,6 @@ import {
   buildManagedCodexHookTrustState,
   escapeTomlBasicString,
   ManagedCodexHooksPlanError,
-  scanManagedCodexHookTrustStateFromContent,
   type CodexHooksJsonTrustStateEntry,
   type ManagedCodexHookTrustState,
   type ManagedCodexHookOptions,
@@ -93,9 +92,9 @@ const OMX_SEEDED_BEHAVIORAL_DEFAULTS_END_MARKER =
   "# End oh-my-codex seeded behavioral defaults";
 
 export const OMX_DEVELOPER_INSTRUCTIONS =
-  "You have oh-my-codex installed. AGENTS.md is the orchestration brain and main control surface. Follow AGENTS.md for skill/keyword routing, $name workflow invocation, and role-specialized subagents; when the native surface exposes `agent_type` role routing, set `agent_type` to an installed role and never omit it for OMX work. When it reports `role_routing_unavailable`, do not fabricate `agent_type`; before Ralplan planning, state, HUD, runtime, or delegation work, run `omx ralplan preflight --json` and stop on `unsupported_documented_leader_proof`. Never fake the role via a prompt label or infer authority from session/thread/pointer/transcript/cwd state. Use outcome-first, concise progress updates: state the target result, constraints, validation evidence, and stop condition before adding process detail. Native subagents live in .codex/agents and may handle independent parallel subtasks within one Codex session or team pane. Skills load from .codex/skills, not native-agent TOMLs. Treat installed prompts as narrower execution surfaces under AGENTS.md authority.";
+  "You have oh-my-codex installed. AGENTS.md is the orchestration brain and main control surface. Follow AGENTS.md for skill/keyword routing, $name workflow invocation, and role-specialized subagents; when the native surface exposes `agent_type` role routing, set `agent_type` to an installed role and never omit it for OMX work. When it reports `role_routing_unavailable` and adapted Ralplan authority is requested, do not fabricate `agent_type`; run `omx ralplan preflight --json` and stop on `unsupported_documented_leader_proof`. Ordinary work remains under its own workflow gates. Never fake the role via a prompt label or infer authority from session/thread/pointer/transcript/cwd state. Use outcome-first, concise progress updates: state the target result, constraints, validation evidence, and stop condition before adding process detail. Native subagents live in .codex/agents and may handle independent parallel subtasks within one Codex session or team pane. Skills load from .codex/skills, not native-agent TOMLs. Treat installed prompts as narrower execution surfaces under AGENTS.md authority.";
 export const OMX_PLUGIN_DEVELOPER_INSTRUCTIONS =
-  '<omx version="1">You have oh-my-codex installed through Codex plugin mode. AGENTS.md is the orchestration brain and main control surface. Follow AGENTS.md for skill/keyword routing and $name workflow invocation. When the native surface exposes `agent_type` role routing, set `agent_type` to an installed role and never omit it for OMX work. When it reports `role_routing_unavailable`, do not fabricate `agent_type`; before Ralplan planning, state, HUD, runtime, or delegation work, run `omx ralplan preflight --json` and stop on `unsupported_documented_leader_proof`. Never fake the role via a prompt label or infer authority from session/thread/pointer/transcript/cwd state. Registered Codex plugin marketplace surfaces supply OMX workflows and plugin-scoped companion resources when the plugin is installed; native agent roles are installed as setup-owned Codex agent TOML files in plugin mode so agent_type routing works. User-installed skills may still live under ~/.codex/skills. Use outcome-first, concise progress updates: state the target result, constraints, validation evidence, and stop condition before adding process detail.</omx>';
+  '<omx version="1">You have oh-my-codex installed through Codex plugin mode. AGENTS.md is the orchestration brain and main control surface. Follow AGENTS.md for skill/keyword routing and $name workflow invocation. When the native surface exposes `agent_type` role routing, set `agent_type` to an installed role and never omit it for OMX work. When it reports `role_routing_unavailable` and adapted Ralplan authority is requested, do not fabricate `agent_type`; run `omx ralplan preflight --json` and stop on `unsupported_documented_leader_proof`. Ordinary work remains under its own workflow gates. Never fake the role via a prompt label or infer authority from session/thread/pointer/transcript/cwd state. Registered Codex plugin marketplace surfaces supply OMX workflows and plugin-scoped companion resources when the plugin is installed; native agent roles are installed as setup-owned Codex agent TOML files in plugin mode so agent_type routing works. User-installed skills may still live under ~/.codex/skills. Use outcome-first, concise progress updates: state the target result, constraints, validation evidence, and stop condition before adding process detail.</omx>';
 const SHARED_MCP_REGISTRY_MARKER = "oh-my-codex (OMX) Shared MCP Registry Sync";
 const SHARED_MCP_REGISTRY_END_MARKER =
   "# End oh-my-codex shared MCP registry sync";
@@ -293,6 +292,38 @@ export async function cleanCodexModelAvailabilityNuxIfNeeded(
 
 export function hasLegacyOmxTeamRunTable(config: string): boolean {
   return LEGACY_OMX_TEAM_RUN_TABLE_PATTERN.test(config);
+}
+function stripLegacyOmxTeamRunTable(config: string): string {
+  const lines = config.split(/\r?\n/);
+  const result: string[] = [];
+  for (let i = 0; i < lines.length; ) {
+    const line = lines[i];
+    if (!LEGACY_OMX_TEAM_RUN_TABLE_PATTERN.test(line)) {
+      result.push(line);
+      i += 1;
+      continue;
+    }
+    // Retired table found: drop any immediately preceding OMX comment or
+    // blank lines (mirrors stripOrphanedOmxSections), then the table header
+    // and its body up to the next [table] header.
+    while (result.length > 0) {
+      const last = result[result.length - 1];
+      if (last.trim() === "" || /^#\s*(OMX|oh-my-codex)/i.test(last)) {
+        result.pop();
+      } else {
+        break;
+      }
+    }
+    i += 1;
+    // Consume the table body up to the next [table] header, but never past
+    // the OMX block footer — the end marker is a comment, not a header, and
+    // must survive a last-table removal (issue #3447).
+    while (i < lines.length && !/^\s*\[/.test(lines[i])) {
+      if (lines[i].trim() === OMX_CONFIG_END_MARKER) break;
+      i += 1;
+    }
+  }
+  return result.join("\n");
 }
 
 function unwrapTomlString(value: string | undefined): string | undefined {
@@ -3448,6 +3479,49 @@ function upsertTuiStatusLine(
     hadExistingTui: true,
   };
 }
+/**
+ * Collapse duplicate `[tui]` tables to a single verbatim first table.
+ *
+ * The launch repair uses this instead of `upsertTuiStatusLine` so the first
+ * table — including any surrounding OMX marker comments that precede the next
+ * [table] header — is preserved byte-for-byte and no status line is injected.
+ */
+function dedupeTuiTables(config: string): string {
+  const lines = config.split(/\r?\n/);
+  const sections: Array<{ start: number; end: number }> = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!/^\s*\[tui\]\s*$/.test(lines[i])) continue;
+    let end = lines.length;
+    for (let j = i + 1; j < lines.length; j += 1) {
+      if (/^\s*\[\[?[^\]]+\]?\]\s*$/.test(lines[j])) {
+        end = j;
+        break;
+      }
+      // The OMX block footer is comments, not a [table] header — stop before
+      // it so dropping a trailing duplicate never swallows the end marker.
+      if (lines[j].trim() === OMX_CONFIG_END_MARKER) {
+        end = j;
+        break;
+      }
+    }
+    sections.push({ start: i, end });
+    i = end - 1;
+  }
+  if (sections.length <= 1) return config;
+  const droppedStarts = new Set(
+    sections.slice(1).map((section) => section.start),
+  );
+  const rebuilt: string[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const dropped = sections.find((section) => section.start === i);
+    if (dropped && droppedStarts.has(i)) {
+      i = dropped.end - 1;
+      continue;
+    }
+    rebuilt.push(lines[i]);
+  }
+  return rebuilt.join("\n").replace(/\n{3,}/g, "\n\n");
+}
 
 // ---------------------------------------------------------------------------
 // OMX [table] sections block (appended at end of file)
@@ -4057,64 +4131,23 @@ export function buildMergedConfig(
  * OMX builds no longer ship the team MCP entrypoint, so we repair both before
  * the CLI is spawned.
  *
+ * The repair is surgical: only the detected targets are changed — missing
+ * launcher-backed MCP `startup_timeout_sec` entries are added, retired
+ * `[mcp_servers.omx_team_run]` tables are dropped, and duplicate `[tui]`
+ * tables are deduplicated. Everything else is preserved byte-for-byte,
+ * including user-owned `notify` and `model_reasoning_effort` values, managed
+ * hook trust state, and any existing OMX managed block; a config that never
+ * had an OMX block does not get one injected (see issue #3447).
+ *
+ * `pkgRoot` and `options` are retained for API compatibility; the surgical
+ * repair does not rebuild the managed block, so it never needs them.
+ *
  * Returns `true` if a repair was performed.
  */
-function managedHookTrustProofRequiredForRepair(config: string): boolean {
-  const inventory = collectManagedHookTrustStateSourceRepresentations(config);
-  return managedMarkerTrustStateConflicts(
-    inventory.source,
-    inventory.representations,
-    inventory.managedMarkerRanges,
-    inventory.markerContainedHooksStateSpans,
-    inventory.invalidMarkerContainedHooksStateSpans,
-    inventory.parsedStatementSpans,
-    inventory.parsedAssignmentSpans,
-    managedHookTrustStateExpectations(),
-  ).size > 0;
-}
-
-async function launchRepairOptionsWithManagedHookTrustProof(
-  configPath: string,
-  config: string,
-  options: MergeOptions,
-): Promise<MergeOptions> {
-  if (!managedHookTrustProofRequiredForRepair(config)) {
-
-    return options;
-  }
-
-  const hooksPath = options.codexHooksFile ?? resolve(configPath, "..", "hooks.json");
-  let hooksContent: string;
-  try {
-    hooksContent = await readFile(hooksPath, "utf-8");
-  } catch (error) {
-    throw new ManagedCodexHooksPlanError(
-      "invalid_document",
-      `Cannot safely repair config.toml because the current hooks artifact at ${hooksPath} could not be read.`,
-      { cause: String(error), hooksPath },
-    );
-  }
-
-  const trustScan = scanManagedCodexHookTrustStateFromContent(
-    hooksContent,
-    hooksPath,
-    managedCodexHookOptionsFromMergeOptions(options),
-  );
-  if (!trustScan.ok) throw trustScan.error;
-
-  return {
-    ...options,
-    codexHooksFile: hooksPath,
-    codexHooksContent: hooksContent,
-    managedHookTrustState: trustScan.trustState,
-    priorManagedHookTrustState: trustScan.trustState,
-  };
-}
-
 export async function repairConfigIfNeeded(
   configPath: string,
-  pkgRoot: string,
-  options: MergeOptions = {},
+  _pkgRoot: string,
+  _options: MergeOptions = {},
 ): Promise<boolean> {
   if (!existsSync(configPath)) return false;
 
@@ -4126,17 +4159,31 @@ export async function repairConfigIfNeeded(
   if (tuiCount <= 1 && !hasLegacyTeamRunTable && !hasLauncherTimeoutGap)
     return false;
 
-  // Managed config compatibility issue detected — derive proof from the current
-  // hooks artifact before any marker stripping can replace managed trust state.
-  const repairOptions = await launchRepairOptionsWithManagedHookTrustProof(
-    configPath,
-    content,
-    options,
-  );
-  const repaired = buildMergedConfig(content, pkgRoot, repairOptions);
+  let repaired = content;
+  if (hasLauncherTimeoutGap) {
+    repaired = addDefaultLauncherMcpStartupTimeouts(repaired);
+  }
+  if (hasLegacyTeamRunTable) {
+    repaired = stripLegacyOmxTeamRunTable(repaired);
+  }
+  if (tuiCount > 1) {
+    repaired = dedupeTuiTables(repaired);
+  }
   if (repaired === content) return false;
+  // The surgical helpers normalize to LF internally; write back with the
+  // original file's dominant line ending so a CRLF config stays CRLF.
+  const newline = dominantNewline(content);
+  if (newline === "\r\n") {
+    repaired = repaired.replace(/\r?\n/g, "\r\n");
+  }
   await writeFile(configPath, repaired);
   return true;
+}
+
+function dominantNewline(text: string): "\r\n" | "\n" {
+  const crlf = (text.match(/\r\n/g) ?? []).length;
+  const lf = (text.match(/\n/g) ?? []).length - crlf;
+  return crlf >= lf ? "\r\n" : "\n";
 }
 
 export async function mergeConfig(

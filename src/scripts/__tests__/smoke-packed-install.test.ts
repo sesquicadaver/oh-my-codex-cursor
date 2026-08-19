@@ -7,6 +7,7 @@ import { delimiter, join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 import {
+  assertPackedLaunchCwdPreserved,
   assertInstalledPluginSurface,
   assertInstalledReasoningDeclarationContract,
   assertInstalledReasoningRuntimeContract,
@@ -14,9 +15,11 @@ import {
   assertInstalledRootReasoningRejection,
   assertInstalledTeamSkillContract,
   assertPackedInstallFileMetadata,
+  assertPackedRegressionWorkflowState,
   buildNativeHookSmokePayload,
   ensureRepoDependencies,
   hasUsableNodeModules,
+  buildPackedProbeEnv,
   buildPackedRegressionEnvironment,
   CODEX_APP_SERVER_TIMEOUTS,
   CodexAppServer,
@@ -41,9 +44,13 @@ import {
   parseNpmPackJsonOutput,
   parseCodexHooksListResult,
   probeCodexVersion,
+  parseArgs,
   resolveGitCommonDir,
   resolveReusableNodeModulesSource,
+  replacePathKeyCaseInsensitive,
+  resolvePackedSmokeRuntimeBinary,
   validateHookStdout,
+  shouldPackedRegressionStopBlock,
   assertCodexBatchWriteResult,
   assertGeneratedTrustMatchesCodex,
   managedCodexHooksByEvent,
@@ -64,6 +71,126 @@ function createFakeCodexAppServer(
   return new CodexAppServer(child as never);
 }
 
+
+test('packed smoke resolves and validates the platform-aware repo runtime', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'omx-packed-runtime-'));
+  try {
+    const debugDir = join(root, 'target', 'debug');
+    await mkdir(debugDir, { recursive: true });
+    const runtimePath = join(debugDir, 'omx-runtime');
+    await writeFile(runtimePath, '#!/bin/sh\nexit 0\n');
+    await chmod(runtimePath, 0o755);
+    assert.equal(resolvePackedSmokeRuntimeBinary(root, { platform: 'linux' }), runtimePath);
+
+    const windowsRuntimePath = join(debugDir, 'omx-runtime.exe');
+    await writeFile(windowsRuntimePath, 'windows executable fixture');
+    assert.equal(resolvePackedSmokeRuntimeBinary(root, { platform: 'win32' }), windowsRuntimePath);
+    assert.throws(
+      () => resolvePackedSmokeRuntimeBinary(root, { platform: 'linux', candidate: 'relative/omx-runtime' }),
+      /must be absolute/,
+    );
+    assert.equal(
+      resolvePackedSmokeRuntimeBinary(root, { platform: 'linux', candidate: runtimePath }),
+      runtimePath,
+    );
+    assert.throws(
+      () => resolvePackedSmokeRuntimeBinary(join(root, 'missing'), { platform: 'linux' }),
+      /run "npm run build:runtime"/,
+    );
+    const nonExecutablePath = join(root, 'non-executable-runtime');
+    await writeFile(nonExecutablePath, 'not executable');
+    await chmod(nonExecutablePath, 0o644);
+    assert.throws(
+      () => resolvePackedSmokeRuntimeBinary(root, { platform: 'linux', candidate: nonExecutablePath }),
+      /executable regular file/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('packed probe env strips ambient runtime and supports default, absent, and explicit provisioning', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'omx-packed-probe-env-'));
+  try {
+    const debugDir = join(root, 'target', 'debug');
+    await mkdir(debugDir, { recursive: true });
+    const runtimePath = join(debugDir, 'omx-runtime');
+    await writeFile(runtimePath, '#!/bin/sh\nexit 0\n');
+    await chmod(runtimePath, 0o755);
+
+    const defaultEnv = buildPackedProbeEnv(
+      { OMX_RUNTIME_BINARY: '/tmp/ambient-decoy' },
+      { repoRoot: root },
+    );
+    assert.equal(defaultEnv.OMX_RUNTIME_BINARY, runtimePath);
+    const absentEnv = buildPackedProbeEnv({}, { runtimeBinary: null });
+    assert.equal(Object.hasOwn(absentEnv, 'OMX_RUNTIME_BINARY'), false);
+    const explicitEnv = buildPackedProbeEnv({}, { runtimeBinary: runtimePath });
+    assert.equal(explicitEnv.OMX_RUNTIME_BINARY, runtimePath);
+    assert.throws(
+      () => buildPackedProbeEnv({}, { runtimeBinary: 'relative/omx-runtime' }),
+      /must be absolute/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('packed fail-closed PATH replacement removes a win32-shaped decoy runtime and every casing variant', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'omx-packed-path-isolation-'));
+  try {
+    const decoyDir = join(root, 'decoy');
+    const isolatedDir = join(root, 'isolated');
+    await mkdir(decoyDir);
+    await mkdir(isolatedDir);
+    const decoyRuntime = join(decoyDir, 'omx-runtime.exe');
+    await writeFile(decoyRuntime, 'decoy');
+    await access(decoyRuntime);
+
+    const env = replacePathKeyCaseInsensitive(
+      { Path: decoyDir, PATH: join(root, 'other'), KEEP: '1' },
+      isolatedDir,
+    );
+    const pathKeys = Object.keys(env).filter((key) => key.toUpperCase() === 'PATH');
+    assert.deepEqual(pathKeys, ['Path']);
+    assert.equal(env.Path, isolatedDir);
+    assert.equal(env.Path.split(delimiter).includes(decoyDir), false);
+    assert.equal(env.KEEP, '1');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('packed fail-closed PATH replacement creates a single POSIX key when absent', () => {
+  const env = replacePathKeyCaseInsensitive({ KEEP: '1' }, '/isolated');
+  assert.deepEqual(env, { KEEP: '1', PATH: '/isolated' });
+});
+
+test('packed launch cwd assertion accepts filesystem aliases and rejects distinct directories', async () => {
+  if (process.platform === 'win32') return;
+  const root = await mkdtemp(join(tmpdir(), 'omx-packed-cwd-'));
+  try {
+    const realDir = join(root, 'real');
+    const otherDir = join(root, 'other');
+    const aliasDir = join(root, 'alias');
+    await mkdir(realDir);
+    await mkdir(otherDir);
+    await symlink(realDir, aliasDir);
+    assert.doesNotThrow(() => assertPackedLaunchCwdPreserved(realDir, aliasDir, 'cwd mismatch'));
+    assert.throws(
+      () => assertPackedLaunchCwdPreserved(realDir, otherDir, 'cwd mismatch'),
+      /cwd mismatch: expected .* received /,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('packed smoke arguments expose a probe-only mode and reject unknown flags', () => {
+  assert.deepEqual(parseArgs([]), { failClosedProbe: false });
+  assert.deepEqual(parseArgs(['--fail-closed-probe']), { failClosedProbe: true });
+  assert.throws(() => parseArgs(['--unknown']), /Unknown argument/);
+});
 
 test('packed install smoke retains narrow boot commands and adds the isolated lifecycle separately', () => {
   assert.deepEqual(PACKED_INSTALL_SMOKE_CORE_COMMANDS, [
@@ -98,20 +225,33 @@ test('packed 0.144.5 fixture is sanitized, pointer-free, and kept separate from 
   assert.equal(PACKED_CODEX_01445_NO_POINTER_NO_TRACKER_FIXTURE.session_id.includes('-'), true);
 });
 
-test('packed plugin collaboration success stays authoritative over unrelated child prose', () => {
-  const packedResponse = JSON.stringify({
+test('source parser regression keeps collaboration results authoritative over unrelated child prose', () => {
+  const successfulResponse = JSON.stringify({
     success: true,
     status: 'completed',
-    output: 'Packed/plugin child succeeded; an optional adapter was unavailable, unsupported, and not found.',
+    agents: [{ agent_name: '/root', agent_status: 'running' }],
+    output: 'Child succeeded; an optional adapter was unavailable, unsupported, and not found.',
   });
   for (const toolName of [
     'collaboration.spawn_agent',
     'collaboration.list_agents',
+    'collaborationlist_agents',
     'collaboration.followup_task',
     'collaboration.wait_agent',
   ]) {
-    assert.equal(parseNativeSubagentResultDisposition(toolName, packedResponse).kind, 'success', toolName);
+    assert.equal(parseNativeSubagentResultDisposition(toolName, successfulResponse).kind, 'success', toolName);
   }
+
+  const nestedLifecycleOnly = JSON.stringify({
+    agents: [
+      { agent_name: '/root', agent_status: 'running' },
+      {
+        agent_name: '/root/reviewer',
+        agent_status: { completed: 'Optional adapter is unavailable and unsupported.' },
+      },
+    ],
+  });
+  assert.equal(parseNativeSubagentResultDisposition('collaborationlist_agents', nestedLifecycleOnly).kind, 'unknown');
 });
 
 test('packed lifecycle keeps the pinned newline-delimited Codex app-server envelopes literal', () => {
@@ -714,24 +854,40 @@ test('packed lifecycle fails before probing the 33rd unique PATH candidate', asy
   if (process.platform === 'win32') return;
   const root = await mkdtemp(join(tmpdir(), 'omx-codex-candidate-budget-'));
   const candidateDirs = Array.from({ length: 33 }, (_value, index) => join(root, `candidate-${index}`));
-  const thirtyThirdProbe = join(root, '33rd-candidate-was-probed');
+  // Duplicate the first PATH entry twice to demonstrate that PATH de-duplication
+  // (by resolved candidate path) does not consume extra candidate-budget slots,
+  // while still preserving first-occurrence probing order.
+  const pathValue = [candidateDirs[0], candidateDirs[0], ...candidateDirs].join(delimiter);
+  const spawnedExecutables: string[] = [];
+  const spawnSyncImpl = ((command: string) => {
+    spawnedExecutables.push(command);
+    return { status: 1, stdout: '', stderr: '', error: undefined };
+  }) as never;
   try {
     await Promise.all(candidateDirs.map((dir) => mkdir(dir, { recursive: true })));
-    await Promise.all(candidateDirs.map(async (dir, index) => {
+    await Promise.all(candidateDirs.map(async (dir) => {
       const executable = join(dir, 'codex');
-      await writeFile(
-        executable,
-        index === candidateDirs.length - 1
-          ? `#!/bin/sh\n: > ${JSON.stringify(thirtyThirdProbe)}\nprintf '%s\\n' 'codex-cli 0.142.5'\n`
-          : '#!/bin/sh\nexit 1\n',
-      );
+      // These candidates are never actually executed: spawnSyncImpl is a
+      // deterministic seam that returns an immediate nonzero result without
+      // starting a real shell process. Only filesystem presence is real.
+      await writeFile(executable, '#!/bin/sh\nexit 1\n');
       await chmod(executable, 0o755);
     }));
     assert.throws(
-      () => probeCodexVersion(root, { PATH: candidateDirs.join(delimiter) }),
+      () => probeCodexVersion(root, { PATH: pathValue }, { spawnSyncImpl }),
       /32-candidate PATH budget/,
     );
-    await assert.rejects(access(thirtyThirdProbe));
+    assert.equal(spawnedExecutables.length, 32, 'must probe exactly 32 unique candidates before the budget error');
+    assert.deepEqual(
+      spawnedExecutables,
+      candidateDirs.slice(0, 32).map((dir) => join(dir, 'codex')),
+      'must probe unique candidates in PATH order, with the duplicated first entry counted only once',
+    );
+    const thirtyThirdExecutable = join(candidateDirs[32], 'codex');
+    assert.ok(
+      !spawnedExecutables.includes(thirtyThirdExecutable),
+      'the 33rd unique candidate must never be spawned',
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -990,13 +1146,13 @@ test('packed install smoke covers directive activation and terminal false-activa
     { name: 'doc-preserves-earlier', prompt: 'Use autopilot mode; "note"; use $ralplan is the workflow command.', expectedSkill: 'autopilot', expectedStopBlock: true },
     { name: 'doc-colon-followup', prompt: 'use $ralplan is the workflow command: use $autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
     { name: 'table-followup', prompt: 'Mode | Meaning\n--- | ---\nmanual | documentation\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true },
-    { name: 'neg-advance-reopen', prompt: 'Do not run $ralplan but advance to $ultragoal', expectedSkill: 'ultragoal', expectedStopBlock: false },
-    { name: 'neg-jump-reopen', prompt: 'Do not run $ralplan but jump straight to $ultragoal', expectedSkill: 'ultragoal', expectedStopBlock: false },
+    { name: 'neg-advance-reopen', prompt: 'Do not run $ralplan but advance to $ultragoal', expectedSkill: 'ultragoal', expectedStopBlock: false, insideTmux: true },
+    { name: 'neg-jump-reopen', prompt: 'Do not run $ralplan but jump straight to $ultragoal', expectedSkill: 'ultragoal', expectedStopBlock: false, insideTmux: true },
     { name: 'reference-plain-title', prompt: '[docs]: /target "title\nplain text"\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true },
     { name: 'reference-plain-destination', prompt: '[docs]: ./target\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true },
     { name: 'directive-use-the', prompt: 'Do not run $ralplan; use the $autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
     { name: 'directive-continue-after-quote', prompt: '"quoted"\ncontinue with $ralplan', expectedSkill: 'ralplan', expectedStopBlock: true },
-    { name: 'doc-advance-followup', prompt: 'use $ralplan is the workflow command; advance to $ultragoal', expectedSkill: 'ultragoal', expectedStopBlock: false },
+    { name: 'doc-advance-followup', prompt: 'use $ralplan is the workflow command; advance to $ultragoal', expectedSkill: 'ultragoal', expectedStopBlock: false, insideTmux: true },
     { name: 'directive-run-code-review', prompt: 'run $code-review', expectedSkill: 'code-review', expectedStopBlock: false },
     { name: 'directive-documentation', prompt: 'use $ralplan is the consensus-planning command', expectedSkill: null, expectedStopBlock: false },
     { name: 'nested-bounded-child-unbounded-parent', prompt: '"`x`\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
@@ -1028,11 +1184,37 @@ test('packed install smoke covers directive activation and terminal false-activa
     { name: 'percent-suffix', prompt: '$ralplan%docs', expectedSkill: null, expectedStopBlock: false },
     { name: 'fullwidth-percent-suffix', prompt: '$ralplan％docs', expectedSkill: null, expectedStopBlock: false },
     { name: 'g1a-ordered-multi-skill', prompt: '$ralplan, $autopilot; $team', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: ['autopilot', 'team'], expectedActiveSkills: ['ralplan'], insideTmux: true },
-    { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: ['autopilot'] },
+    { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: [] },
     { name: 'b3-longer-valid-fence', prompt: '```text\n$autopilot build it\n````\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true },
     { name: 'b4-shorter-invalid-fence', prompt: '````text\n$autopilot build it\n```\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
     { name: 'b5-different-marker-invalid-fence', prompt: '```text\n$autopilot build it\n~~~\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
   ]);
+});
+
+test('packed regression workflow expectations distinguish active activation from receipt-unavailable Autopilot termination', () => {
+  assert.doesNotThrow(() => assertPackedRegressionWorkflowState(
+    { name: 'active-ralplan', expectedSkill: 'ralplan' },
+    { active: true, skill: 'ralplan' },
+  ));
+  assert.doesNotThrow(() => assertPackedRegressionWorkflowState(
+    { name: 'failed-autopilot', expectedSkill: 'autopilot' },
+    {
+      active: false,
+      skill: 'autopilot',
+      phase: 'failed',
+      error: 'documented_host_consensus_receipt_unavailable',
+      active_skills: [],
+    },
+  ));
+  assert.throws(() => assertPackedRegressionWorkflowState(
+    { name: 'stale-active-autopilot', expectedSkill: 'autopilot' },
+    { active: true, skill: 'autopilot', phase: 'running', active_skills: [{ skill: 'autopilot' }] },
+  ), /persisted unexpected workflow state/);
+});
+
+test('packed regression Stop expectations release terminal receipt-unavailable Autopilot state', () => {
+  assert.equal(shouldPackedRegressionStopBlock({ expectedSkill: 'ralplan', expectedStopBlock: true }), true);
+  assert.equal(shouldPackedRegressionStopBlock({ expectedSkill: 'autopilot', expectedStopBlock: true }), false);
 });
 
 test('packed regression environment clears inherited Team routing state', () => {
@@ -1265,6 +1447,14 @@ test('packed install helpers freeze installed runtime and declaration reasoning 
   );
 });
 
+test('packed install removes same-user native-anchor authentication', async () => {
+  const hookSource = await readFile(join(process.cwd(), 'src/scripts/codex-native-hook.ts'), 'utf8');
+  const cliSource = await readFile(join(process.cwd(), 'src/cli/index.ts'), 'utf8');
+  assert.doesNotMatch(hookSource, /isVerifiedPluginLauncherClaim|classifyNativeTranscriptProvenance|signNativeLeaderAttestation|native-anchor-auth/);
+  assert.match(hookSource, /unsupported_documented_leader_proof/);
+  assert.match(cliSource, /execWithOverlay[\s\S]+OMX_CODEX_LAUNCH_ID[\s\S]+buildHudRuntimeEnv\(\{ sessionId/);
+});
+
 test('packed install contract requires canonical/plugin Team skill parity and text', async () => {
   const canonical = await readFile(join(process.cwd(), 'skills/team/SKILL.md'));
   const pluginMirror = await readFile(join(process.cwd(), 'plugins/oh-my-codex/skills/team/SKILL.md'));
@@ -1325,6 +1515,7 @@ test('packed install plugin assertions enforce the packaged plugin contract', as
         "import { spawn } from 'node:child_process';",
         "import { join } from 'node:path';",
         "const OMX_PLUGIN_HOOK_LAUNCHER_CONTRACT_MARKER = 'omx-plugin-hook-launcher:v1';",
+        "const OMX_PLUGIN_HOOK_ROUTING_ONLY_MARKER = 'omx-plugin-hook-routing-only:v1';",
         "const hookDir = new URL('.', import.meta.url).pathname;",
         'function readPinnedLauncher() {',
         "  const launcherPath = join(hookDir, 'omx-command.json');",

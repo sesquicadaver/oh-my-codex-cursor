@@ -4,6 +4,8 @@ import { dirname, join } from 'node:path';
 
 import { withModeRuntimeContext } from './mode-state-context.js';
 import {
+  createWritableCommitRevalidator,
+  getStateFilename,
   getAllScopedStatePaths,
   getAuthoritativeActiveStateDirs,
   getBaseStateDir,
@@ -17,6 +19,8 @@ import {
   resolveWorkingDirectoryForState,
   validateSessionId,
   validateStateModeSegment,
+  type BeforeWritableCommit,
+  type ResolvedStateScope,
   type StateRootSource,
 } from '../mcp/state-paths.js';
 import { evaluateRalphCompletionAuditEvidence } from '../ralph/completion-audit.js';
@@ -44,6 +48,7 @@ import {
   type SkillActiveEntry,
   type SkillActiveStateLike,
   writeSkillActiveStateCopiesForStateDir,
+  writeSkillActiveStateWithPrimaryTransactionForStateDir,
 } from './skill-active.js';
 import {
   buildWorkflowTransitionError,
@@ -59,6 +64,7 @@ import {
 import {
   type AutopilotChildPhase,
   deriveAutopilotChildPhase,
+  normalizeAutopilotPhase,
 } from '../autopilot/fsm.js';
 import {
   buildAutopilotRalplanUltragoalGateError,
@@ -69,6 +75,8 @@ import {
 } from '../leader/contract.js';
 import {
   buildRalplanConsensusGateFromSources,
+  RALPLAN_CONSENSUS_BLOCKED_REASONS,
+  shouldBlockFreshAutopilotForRalplanReceipt,
 } from '../ralplan/consensus-gate.js';
 
 
@@ -167,6 +175,7 @@ async function writeClearedSessionScopedModeState(
   path: string,
   mode: string,
   sessionId: string,
+  beforeCommit?: BeforeWritableCommit,
 ): Promise<void> {
   const nowIso = new Date().toISOString();
   const clearedState = withModeRuntimeContext({}, {
@@ -177,16 +186,22 @@ async function writeClearedSessionScopedModeState(
     completed_at: nowIso,
     session_id: sessionId,
   });
-  await writeAtomicFile(path, JSON.stringify(clearedState, null, 2));
+  const payload = JSON.stringify(clearedState, null, 2);
+  await beforeCommit?.({ site: 'state-clear.primary', kind: 'write', path });
+  await writeAtomicFile(path, payload);
 }
 
-async function clearSessionNativeStopState(baseStateDir: string, sessionId: string): Promise<string[]> {
+async function clearSessionNativeStopState(
+  baseStateDir: string,
+  sessionId: string,
+  beforeCommit?: BeforeWritableCommit,
+): Promise<string[]> {
   const paths = [
-    join(baseStateDir, 'native-stop-state.json'),
-    join(baseStateDir, 'sessions', sessionId, 'native-stop-state.json'),
+    { path: join(baseStateDir, 'native-stop-state.json'), site: 'native-stop.root' as const },
+    { path: join(baseStateDir, 'sessions', sessionId, 'native-stop-state.json'), site: 'native-stop.session' as const },
   ];
   const changed: string[] = [];
-  for (const path of paths) {
+  for (const { path, site } of paths) {
     if (!existsSync(path)) continue;
     let state: Record<string, unknown>;
     try {
@@ -200,7 +215,9 @@ async function clearSessionNativeStopState(baseStateDir: string, sessionId: stri
     if (!sessions || !Object.prototype.hasOwnProperty.call(sessions, sessionId)) continue;
     delete sessions[sessionId];
     state.sessions = sessions;
-    await writeAtomicFile(path, JSON.stringify(state, null, 2));
+    const payload = JSON.stringify(state, null, 2);
+    await beforeCommit?.({ site, kind: 'write', path });
+    await writeAtomicFile(path, payload);
     changed.push(path);
   }
   return changed;
@@ -222,9 +239,14 @@ async function initializeStateEnvironment(
   cwd: string,
   effectiveSessionId?: string,
   rootSource?: StateRootSource,
+  exactStateDir?: string,
 ): Promise<void> {
-  await mkdir(getStateDir(cwd), { recursive: true });
-  if (effectiveSessionId) {
+  if (exactStateDir) {
+    await mkdir(exactStateDir, { recursive: true });
+  } else {
+    await mkdir(getStateDir(cwd), { recursive: true });
+  }
+  if (effectiveSessionId && !exactStateDir) {
     await mkdir(getStateDir(cwd, effectiveSessionId), { recursive: true });
   }
   if (rootSource === 'team-env') return;
@@ -517,10 +539,13 @@ function collectCompletedRalplanSessionEntries(
   return [...entries.values()];
 }
 
-async function writeAtomicJson(path: string, value: unknown): Promise<void> {
+function serializeAtomicJson(value: unknown): string {
   const serialized = JSON.stringify(value, null, 2);
   JSON.parse(serialized);
-  await mkdir(dirname(path), { recursive: true });
+  return serialized;
+}
+
+async function writeAtomicJson(path: string, serialized: string): Promise<void> {
   await writeAtomicFile(path, serialized);
 }
 
@@ -545,32 +570,50 @@ export async function completeRalplanSession(options: {
   state: Record<string, unknown>;
   explicitSessionId?: string;
   requireNativeSubagents?: boolean;
+  beforeCommit?: BeforeWritableCommit;
+  capturedScope?: ResolvedStateScope;
 }): Promise<boolean> {
+  if (options.beforeCommit && !options.capturedScope) {
+    throw new Error('completeRalplanSession requires capturedScope when beforeCommit is provided');
+  }
   if (!isCompleteRalplanTerminalState(options.state)) return false;
-  const writableScope = await resolveWritableStateScope(options.cwd, options.explicitSessionId);
+  const writableScope = options.capturedScope
+    ?? await resolveWritableStateScope(options.cwd, options.explicitSessionId);
   const sessionId = writableScope.sessionId;
   const validationError = validateRalplanTerminalConsensus(options.cwd, options.state, sessionId, {
     requireNativeSubagents: options.requireNativeSubagents === true,
   });
   if (validationError) throw new Error(validationError);
 
+  const beforeCommit = options.beforeCommit ?? createWritableCommitRevalidator({
+    operation: 'completeRalplanSession',
+    cwd: options.cwd,
+    explicitSessionId: options.explicitSessionId,
+    capturedScope: writableScope,
+    baseStateDir: options.baseStateDir,
+  });
   const completedSessionId = sessionId ?? optionalSessionId(options.state.session_id);
   const rootScopeCompletion = !sessionId;
 
   const nowIso = new Date().toISOString();
   const rootState = buildRalplanTerminalState(options.state, sessionId, nowIso);
-  const rootStatePath = getStatePath('ralplan', options.cwd);
+  const rootStatePath = join(options.baseStateDir, getStateFilename('ralplan'));
   const existingRootState = await readJsonRecordIfExists(rootStatePath);
   const shouldWriteRootState = shouldWriteRootRalplanTerminalState(existingRootState, sessionId);
 
   if (shouldWriteRootState) {
-    await writeAtomicJson(rootStatePath, rootState);
+    const rootStatePayload = serializeAtomicJson(rootState);
+    await mkdir(dirname(rootStatePath), { recursive: true });
+    await beforeCommit({ site: 'ralplan.root-state', kind: 'write', path: rootStatePath });
+    await writeAtomicJson(rootStatePath, rootStatePayload);
   }
   if (sessionId) {
-    await writeAtomicJson(
-      getStatePath('ralplan', options.cwd, sessionId),
-      buildRalplanTerminalState(options.state, sessionId, nowIso),
-    );
+    const sessionStatePath = join(writableScope.stateDir, getStateFilename('ralplan'));
+    const sessionState = buildRalplanTerminalState(options.state, sessionId, nowIso);
+    const sessionStatePayload = serializeAtomicJson(sessionState);
+    await mkdir(dirname(sessionStatePath), { recursive: true });
+    await beforeCommit({ site: 'ralplan.session-state', kind: 'write', path: sessionStatePath });
+    await writeAtomicJson(sessionStatePath, sessionStatePayload);
   }
 
   const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(options.baseStateDir, sessionId);
@@ -581,20 +624,28 @@ export async function completeRalplanSession(options: {
     rootScopeCompletion,
   );
   if (rootEntries.length > 0 || (shouldWriteRootState && rootSkillState !== null)) {
-    await writeAtomicJson(rootPath, buildRalplanSkillStateFromEntries(rootSkillState, rootState, rootEntries, undefined, nowIso));
+    const nextRootSkillState = buildRalplanSkillStateFromEntries(rootSkillState, rootState, rootEntries, undefined, nowIso);
+    const rootSkillStatePayload = serializeAtomicJson(nextRootSkillState);
+    await mkdir(dirname(rootPath), { recursive: true });
+    await beforeCommit({ site: 'ralplan.root-skill-write', kind: 'write', path: rootPath });
+    await writeAtomicJson(rootPath, rootSkillStatePayload);
   } else if (rootSkillState !== null && !isTerminalSkillActiveTombstone(rootSkillState)) {
-    await unlink(rootPath).catch(() => {});
+    await beforeCommit({ site: 'ralplan.root-skill-unlink', kind: 'unlink', path: rootPath });
+    await unlink(rootPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') throw error;
+    });
   }
   if (sessionPath && sessionId) {
     const sessionSkillState = await readSkillActiveState(sessionPath);
     const sessionEntries = collectCompletedRalplanSessionEntries(sessionSkillState, rootSkillState, sessionId);
     if (sessionEntries.length > 0 || sessionSkillState !== null) {
-      await writeAtomicJson(
-        sessionPath,
-        sessionEntries.length > 0
-          ? buildRalplanSkillStateFromEntries(sessionSkillState ?? rootSkillState, rootState, sessionEntries, sessionId, nowIso)
-          : buildRalplanTerminalSkillState(sessionSkillState, rootState, sessionId, nowIso),
-      );
+      const nextSessionSkillState = sessionEntries.length > 0
+        ? buildRalplanSkillStateFromEntries(sessionSkillState ?? rootSkillState, rootState, sessionEntries, sessionId, nowIso)
+        : buildRalplanTerminalSkillState(sessionSkillState, rootState, sessionId, nowIso);
+      const sessionSkillStatePayload = serializeAtomicJson(nextSessionSkillState);
+      await mkdir(dirname(sessionPath), { recursive: true });
+      await beforeCommit({ site: 'ralplan.session-skill-write', kind: 'write', path: sessionPath });
+      await writeAtomicJson(sessionPath, sessionSkillStatePayload);
     }
   }
   return true;
@@ -616,7 +667,7 @@ export async function listStateStatuses(
     if (!existsSync(stateDir)) continue;
     const files = await readdir(stateDir);
     for (const file of files) {
-      if (!file.endsWith('-state.json')) continue;
+      if (!file.endsWith('-state.json') || file === 'run-state.json') continue;
       const currentMode = file.replace('-state.json', '');
       if (!mode && currentMode === SKILL_ACTIVE_STATE_MODE) continue;
       if (mode && currentMode !== mode) continue;
@@ -697,6 +748,20 @@ function isActiveDetailWorkflowState(state: Record<string, unknown>): boolean {
   return !['complete', 'completed', 'cancelled', 'canceled', 'failed', 'cleared'].includes(phase);
 }
 
+function isResumableAutopilotState(state: Record<string, unknown>): boolean {
+  if (state.active !== true) return false;
+  if (state.mode !== undefined && state.mode !== 'autopilot') return false;
+
+  const phaseValues = ['current_phase', 'currentPhase']
+    .filter((key) => Object.prototype.hasOwnProperty.call(state, key))
+    .map((key) => normalizeAutopilotPhase(state[key]));
+  if (phaseValues.length === 0 || phaseValues.some((phase) => phase === null || phase === 'complete' || phase === 'failed')) {
+    return false;
+  }
+
+  return new Set(phaseValues).size === 1;
+}
+
 async function readSessionDetailTransitionModes(
   cwd: string,
   sessionId: string | undefined,
@@ -759,8 +824,16 @@ export async function executeStateOperation(
         const effectiveSessionId = stateScope.sessionId;
         const mode = validateStateModeSegment(rawArgs.mode);
         const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
-        await initializeStateEnvironment(cwd, effectiveSessionId, rootSource);
-        const path = getStatePath(mode, cwd, effectiveSessionId);
+        const beforeCommit = createWritableCommitRevalidator({
+          operation: 'state_write',
+          cwd,
+          explicitSessionId,
+          capturedScope: stateScope,
+          baseStateDir,
+        });
+        // Write to the exact resolved scope directory; never recompute the
+        // target root/path after authorization.
+        const path = join(stateScope.stateDir, getStateFilename(mode));
 
         const {
           mode: _mode,
@@ -772,6 +845,7 @@ export async function executeStateOperation(
         let validationError: string | null = null;
         let transitionMessage: string | undefined;
         let ensureRalphArtifacts = false;
+        let skillActivePrimaryCommitted = false;
 
         await withStateWriteLock(path, async () => {
           let existing: Record<string, unknown> = {};
@@ -799,6 +873,28 @@ export async function executeStateOperation(
           if (!hasExplicitStateField(fields, customState, 'terminal_outcome')) {
             delete mergedRaw.terminal_outcome;
           }
+
+          let activeCanonicalModes: TrackedWorkflowMode[] | undefined;
+          let canonicalDecision: ReturnType<typeof evaluateWorkflowTransition> | undefined;
+          if (isTrackedWorkflowMode(mode) && mergedRaw.active === true) {
+            activeCanonicalModes = await readCanonicalActiveWorkflowModes(baseStateDir, effectiveSessionId);
+            canonicalDecision = evaluateWorkflowTransition(activeCanonicalModes, mode);
+            const hasExistingCanonicalRalplan = activeCanonicalModes.includes('ralplan');
+            const freshAutopilotReceiptBlocked = mode === 'autopilot'
+              && !isResumableAutopilotState(existing)
+              && hasExistingCanonicalRalplan
+              && shouldBlockFreshAutopilotForRalplanReceipt();
+            if (freshAutopilotReceiptBlocked) {
+              validationError = `${RALPLAN_CONSENSUS_BLOCKED_REASONS.documentedHostConsensusReceiptUnavailable}: official host consensus receipt verifier is unavailable`;
+              return;
+            }
+            if (!canonicalDecision.allowed && canonicalDecision.denialReason === 'rollback') {
+              validationError = buildWorkflowTransitionError(activeCanonicalModes, mode, 'write');
+              return;
+            }
+          }
+
+          await initializeStateEnvironment(cwd, effectiveSessionId, rootSource, stateScope.stateDir);
 
           if (
             mode === 'ralph' &&
@@ -959,15 +1055,9 @@ export async function executeStateOperation(
           }
 
           if (isTrackedWorkflowMode(mode) && mergedRaw.active === true) {
-            const activeCanonicalModes = await readCanonicalActiveWorkflowModes(baseStateDir, effectiveSessionId);
-            const canonicalDecision = evaluateWorkflowTransition(activeCanonicalModes, mode);
-            if (!canonicalDecision.allowed && canonicalDecision.denialReason === 'rollback') {
-              validationError = buildWorkflowTransitionError(activeCanonicalModes, mode, 'write');
-              return;
-            }
             const transitionCurrentModes = mode === 'ralplan'
               ? (
-                activeCanonicalModes.length > 0
+                activeCanonicalModes!.length > 0
                   ? activeCanonicalModes
                   : await readSessionDetailTransitionModes(cwd, effectiveSessionId, mode)
               )
@@ -978,6 +1068,7 @@ export async function executeStateOperation(
                 sessionId: effectiveSessionId,
                 source: 'state-operations',
                 baseStateDir,
+                beforeCommit,
                 ...(transitionCurrentModes ? { currentModes: transitionCurrentModes } : {}),
               });
               transitionMessage ??= transition.transitionMessage;
@@ -988,7 +1079,24 @@ export async function executeStateOperation(
           }
 
           const merged = withModeRuntimeContext(existing, mergedRaw);
-          await writeAtomicFile(path, JSON.stringify(merged, null, 2));
+          const payload = JSON.stringify(merged, null, 2);
+          if (mode === SKILL_ACTIVE_STATE_MODE && effectiveSessionId) {
+            await writeSkillActiveStateWithPrimaryTransactionForStateDir(
+              baseStateDir,
+              merged,
+              effectiveSessionId,
+              path,
+              async () => {
+                await beforeCommit({ site: 'mode.primary', kind: 'write', path });
+                await writeAtomicFile(path, payload);
+              },
+              { beforeCommit },
+            );
+            skillActivePrimaryCommitted = true;
+          } else {
+            await beforeCommit({ site: 'mode.primary', kind: 'write', path });
+            await writeAtomicFile(path, payload);
+          }
         });
 
         if (validationError) {
@@ -999,9 +1107,11 @@ export async function executeStateOperation(
         }
 
         if (mode === SKILL_ACTIVE_STATE_MODE) {
-          const state = await readSkillActiveState(path);
-          if (state) {
-            await writeSkillActiveStateCopiesForStateDir(baseStateDir, state, effectiveSessionId);
+          if (!skillActivePrimaryCommitted) {
+            const state = await readSkillActiveState(path);
+            if (state) {
+              await writeSkillActiveStateCopiesForStateDir(baseStateDir, state, effectiveSessionId, undefined, { beforeCommit });
+            }
           }
         } else {
           if (mode === 'ralph' && ensureRalphArtifacts) {
@@ -1016,6 +1126,8 @@ export async function executeStateOperation(
               state: data,
               explicitSessionId,
               requireNativeSubagents: true,
+              beforeCommit,
+              capturedScope: stateScope,
             });
 
           if (!ralplanCompletionHandled) {
@@ -1027,6 +1139,7 @@ export async function executeStateOperation(
               currentPhase: typeof data.current_phase === 'string' ? data.current_phase : undefined,
               sessionId: effectiveSessionId,
               source: 'state-operations',
+              beforeCommit,
             });
           }
         }
@@ -1083,18 +1196,26 @@ export async function executeStateOperation(
         const stateScope = await resolveWritableStateScope(cwd, explicitSessionId);
         const effectiveSessionId = stateScope.sessionId;
         await initializeStateEnvironment(cwd, effectiveSessionId, rootSource);
-        const path = getStatePath(mode, cwd, effectiveSessionId);
+        const beforeCommit = createWritableCommitRevalidator({
+          operation: 'state_clear',
+          cwd,
+          explicitSessionId,
+          capturedScope: stateScope,
+          baseStateDir,
+        });
+        const path = join(stateScope.stateDir, getStateFilename(mode));
         if (
           mode !== SKILL_ACTIVE_STATE_MODE
           && effectiveSessionId
           && existsSync(getStatePath(mode, cwd))
         ) {
-          await writeClearedSessionScopedModeState(path, mode, effectiveSessionId);
+          await writeClearedSessionScopedModeState(path, mode, effectiveSessionId, beforeCommit);
         } else if (existsSync(path)) {
+          await beforeCommit({ site: 'state-clear.primary', kind: 'unlink', path });
           await unlink(path);
         }
         const nativeStopCleared = effectiveSessionId
-          ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId)
+          ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId, beforeCommit)
           : [];
         if (mode !== SKILL_ACTIVE_STATE_MODE) {
           await syncCanonicalSkillStateForMode({
@@ -1104,6 +1225,7 @@ export async function executeStateOperation(
             active: false,
             sessionId: effectiveSessionId,
             source: 'state-operations',
+            beforeCommit,
           });
         }
         return { payload: { cleared: true, mode, path, ...(nativeStopCleared.length > 0 ? { native_stop_cleared: nativeStopCleared } : {}) } };

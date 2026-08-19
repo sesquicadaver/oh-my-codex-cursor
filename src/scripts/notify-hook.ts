@@ -550,6 +550,66 @@ async function resolveLeaderNotifyWriteDecision(
   };
 }
 
+async function dispatchTurnCompleteHookEvents(
+  payload: Record<string, any>,
+  cwd: string,
+  payloadSessionId: string,
+  sessionIdForHooks: string,
+): Promise<void> {
+  try {
+    const { buildNativeHookEvent, buildDerivedHookEvent } = await import('../hooks/extensibility/events.js');
+    const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
+    const threadIdForHooks = safeString(payload['thread-id'] || payload.thread_id || '');
+    const turnIdForHooks = safeString(payload['turn-id'] || payload.turn_id || '');
+    const modeForHooks = safeString(payload.mode || '');
+    const outputPreview = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '').slice(0, 400);
+    const event = buildNativeHookEvent('turn-complete', {
+      source: safeString(payload.source || 'native'),
+      type: safeString(payload.type || 'agent-turn-complete'),
+      input_messages: normalizeInputMessages(payload),
+      output_preview: outputPreview,
+      native_session_id: payloadSessionId || null,
+      omx_session_id: sessionIdForHooks || null,
+      ...readRepositoryMetadata(cwd),
+      session_name: resolveOperationalSessionName(cwd, sessionIdForHooks),
+      project_path: cwd,
+      project_name: safeString(payload.project_name || ''),
+    }, {
+      session_id: sessionIdForHooks,
+      thread_id: threadIdForHooks,
+      turn_id: turnIdForHooks,
+      mode: modeForHooks,
+    });
+    await dispatchHookEvent(event, { cwd });
+
+    for (const signal of deriveAssistantSignalEvents(outputPreview)) {
+      const derivedEvent = buildDerivedHookEvent(signal.event, buildOperationalContext({
+        cwd,
+        normalizedEvent: signal.normalized_event,
+        sessionId: sessionIdForHooks,
+        text: outputPreview,
+        status: signal.normalized_event,
+        errorSummary: signal.error_summary,
+        extra: {
+          native_session_id: payloadSessionId || null,
+          omx_session_id: sessionIdForHooks || null,
+          source_event: safeString(payload.type || 'agent-turn-complete'),
+        },
+      }), {
+        session_id: sessionIdForHooks,
+        thread_id: threadIdForHooks,
+        turn_id: turnIdForHooks,
+        mode: modeForHooks,
+        confidence: signal.confidence,
+        parser_reason: signal.parser_reason,
+      });
+      await dispatchHookEvent(derivedEvent, { cwd });
+    }
+  } catch {
+    // Non-fatal: extensibility modules may not be built yet
+  }
+}
+
 async function main() {
   const rawPayload = process.argv[process.argv.length - 1];
   if (!rawPayload || rawPayload.startsWith('-')) {
@@ -578,15 +638,26 @@ async function main() {
   const isTurnComplete = isTurnCompletePayload(payload);
   const isNotifyFallbackTaskComplete = isNotifyFallbackTaskCompletePayload(payload);
 
-  // Team worker detection via environment variable
-  const teamWorkerEnv = process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER; // e.g., "fix-ts/worker-1"
-  const parsedTeamWorker = parseTeamWorkerEnv(teamWorkerEnv);
+  // Team worker detection is authorized only by a syntactically valid internal identity.
+  // Public OMX_TEAM_WORKER is a display alias and must never authorize worker or leader writes.
+  const rawInternalTeamWorker = safeString(process.env.OMX_TEAM_INTERNAL_WORKER).trim();
+  const rawPublicTeamWorker = safeString(process.env.OMX_TEAM_WORKER).trim();
+  const parsedInternalTeamWorker = parseTeamWorkerEnv(rawInternalTeamWorker);
+  const parsedPublicTeamWorker = parseTeamWorkerEnv(rawPublicTeamWorker);
+  const hasTeamWorkerDeclaration = rawInternalTeamWorker !== '' || rawPublicTeamWorker !== '';
+  if (hasTeamWorkerDeclaration && (!parsedInternalTeamWorker
+    || (rawPublicTeamWorker !== '' && !parsedPublicTeamWorker)
+    || (parsedPublicTeamWorker && parsedPublicTeamWorker.workerName !== parsedInternalTeamWorker.workerName))) {
+    return;
+  }
+  const parsedTeamWorker = parsedInternalTeamWorker;
   const isTeamWorker = !!parsedTeamWorker;
 
   const resolvedWorkerStateDir = (isTeamWorker && parsedTeamWorker)
     ? await resolveTeamStateDirForWorker(cwd, parsedTeamWorker)
     : null;
   const workerStateRootResolved = !isTeamWorker || !!resolvedWorkerStateDir;
+  if (isTeamWorker && !workerStateRootResolved) return;
   const stateDir = resolvedWorkerStateDir || getBaseStateDir(cwd);
   const logsDir = join(cwd, '.omx', 'logs');
   const omxDir = join(cwd, '.omx');
@@ -703,31 +774,6 @@ async function main() {
     return;
   }
 
-  if (isTeamWorker && !workerStateRootResolved) {
-    await logNotifyHookEvent(logsDir, {
-      timestamp: new Date().toISOString(),
-      level: 'warn',
-      type: 'team_worker_state_root_unresolved',
-      team_worker: teamWorkerEnv || null,
-      reason: 'skip_team_worker_state_mutations',
-    }).catch(() => {});
-
-    // Keep the fail-closed worker state-root behavior for normal team-worker
-    // mutations, but allow the narrow auto-nudge path to use an explicitly
-    // supplied, already-existing worker state root. Auto-nudge only needs the
-    // worker-scoped state files/pane anchor and should not fall back to creating
-    // local `.omx/state` when identity resolution failed.
-    const explicitWorkerStateRoot = safeString(process.env.OMX_TEAM_STATE_ROOT || '').trim();
-    const autoNudgeStateDir = explicitWorkerStateRoot ? resolve(cwd, explicitWorkerStateRoot) : '';
-    if (autoNudgeStateDir && existsSync(autoNudgeStateDir)) {
-      try {
-        await maybeAutoNudge({ cwd, stateDir: autoNudgeStateDir, logsDir, payload });
-      } catch {
-        // Non-critical
-      }
-    }
-    return;
-  }
 
   // Reconcile Ralph ownership for same-Codex-session continuation before
   // lifecycle counters or injection read the active scope.
@@ -942,8 +988,9 @@ async function main() {
 
   // 4.45. Skill activation tracking: update skill-active-state.json before any nudge logic.
   if (isTeamWorker || canWriteLeaderScopedState) {
+    let activationResult: SkillActiveState | null = null;
     if (latestUserInput) {
-      await recordNotifySkillActivationNonFatal({
+      activationResult = await recordNotifySkillActivationNonFatal({
         stateDir,
         sourceCwd: cwd,
         text: latestUserInput,
@@ -962,6 +1009,12 @@ async function main() {
           } : {}),
         }),
       });
+    }
+    if (activationResult?.skill === 'autopilot'
+      && activationResult.active === false
+      && activationResult.error === 'documented_host_consensus_receipt_unavailable') {
+      await dispatchTurnCompleteHookEvents(payload, cwd, payloadSessionId, getEffectiveSessionId());
+      return;
     }
 
     try {
@@ -1029,59 +1082,7 @@ async function main() {
   }
 
   // 7. Dispatch native turn-complete hook event (best effort, post-dedupe)
-  try {
-    const { buildNativeHookEvent, buildDerivedHookEvent } = await import('../hooks/extensibility/events.js');
-    const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
-    const sessionIdForHooks = getEffectiveSessionId();
-    const threadIdForHooks = safeString(payload['thread-id'] || payload.thread_id || '');
-    const turnIdForHooks = safeString(payload['turn-id'] || payload.turn_id || '');
-    const modeForHooks = safeString(payload.mode || '');
-    const outputPreview = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '').slice(0, 400);
-    const event = buildNativeHookEvent('turn-complete', {
-      source: safeString(payload.source || 'native'),
-      type: safeString(payload.type || 'agent-turn-complete'),
-      input_messages: normalizeInputMessages(payload),
-      output_preview: outputPreview,
-      native_session_id: payloadSessionId || null,
-      omx_session_id: sessionIdForHooks || null,
-      ...readRepositoryMetadata(cwd),
-      session_name: resolveOperationalSessionName(cwd, sessionIdForHooks),
-      project_path: cwd,
-      project_name: safeString(payload.project_name || ''),
-    }, {
-      session_id: sessionIdForHooks,
-      thread_id: threadIdForHooks,
-      turn_id: turnIdForHooks,
-      mode: modeForHooks,
-    });
-    await dispatchHookEvent(event, { cwd });
-
-    for (const signal of deriveAssistantSignalEvents(outputPreview)) {
-      const derivedEvent = buildDerivedHookEvent(signal.event, buildOperationalContext({
-        cwd,
-        normalizedEvent: signal.normalized_event,
-        sessionId: sessionIdForHooks,
-        text: outputPreview,
-        status: signal.normalized_event,
-        errorSummary: signal.error_summary,
-        extra: {
-          native_session_id: payloadSessionId || null,
-          omx_session_id: sessionIdForHooks || null,
-          source_event: safeString(payload.type || 'agent-turn-complete'),
-        },
-      }), {
-        session_id: sessionIdForHooks,
-        thread_id: threadIdForHooks,
-        turn_id: turnIdForHooks,
-        mode: modeForHooks,
-        confidence: signal.confidence,
-        parser_reason: signal.parser_reason,
-      });
-      await dispatchHookEvent(derivedEvent, { cwd });
-    }
-  } catch {
-    // Non-fatal: extensibility modules may not be built yet
-  }
+  await dispatchTurnCompleteHookEvents(payload, cwd, payloadSessionId, getEffectiveSessionId());
 
   // 8. Dispatch session-idle lifecycle notification (lead session only, best effort)
   if (!isTeamWorker) {

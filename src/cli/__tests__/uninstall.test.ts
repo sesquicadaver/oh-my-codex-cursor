@@ -1,9 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
-import { existsSync, lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir as osTmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
@@ -12,8 +12,11 @@ import {
   buildManagedCodexNativeHookWindowsShimContent,
   buildManagedCodexNativeHookWindowsShimPath,
 } from '../../config/codex-hooks.js';
-import { uninstall } from '../uninstall.js';
+import { setUninstallClaimJournalDurabilityForTest, uninstall } from '../uninstall.js';
 import TOML from '@iarna/toml';
+
+const tmpdir = (): string => realpathSync(osTmpdir());
+const shortTmpdir = (): string => process.platform === 'win32' ? tmpdir() : realpathSync('/tmp');
 
 function runOmx(
   cwd: string,
@@ -1824,7 +1827,7 @@ describe('omx uninstall', () => {
       { name: 'finalization', stage: 'after-staged-cleanup', drift: 'config', committed: true },
     ] as const;
     for (const fixture of fixtures) {
-      const wd = await mkdtemp(join(tmpdir(), `omx-uninstall-applied-${fixture.name}-`));
+      const wd = await mkdtemp(join(shortTmpdir(), `omx-uninstall-applied-${fixture.name}-`));
       try {
         await withCwd(wd, async () => {
           const codexDir = join(wd, '.codex');
@@ -3119,7 +3122,7 @@ describe('omx uninstall', () => {
     }
   });
   it('warns once after a successful Windows EPERM-degraded uninstall transaction', async () => {
-    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-durability-'));
+    const wd = await mkdtemp(join(shortTmpdir(), 'omx-uninstall-durability-'));
     const originalStderrWrite = process.stderr.write;
     const stderr: string[] = [];
     try {
@@ -3162,6 +3165,57 @@ describe('omx uninstall', () => {
         assert.match(stderr[0]!, /native-hook uninstall.*degraded durability/);
       });
     } finally {
+      process.stderr.write = originalStderrWrite;
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('completes uninstall when only Windows directory fsync is unsupported', async () => {
+    const wd = await mkdtemp(join(shortTmpdir(), 'omx-uninstall-directory-durability-'));
+    const originalStderrWrite = process.stderr.write;
+    const stderr: string[] = [];
+    const resetDurability = setUninstallClaimJournalDurabilityForTest({
+      platform: 'win32',
+      syncRegularFile: async () => 'synced',
+      syncDirectory: async () => 'unsupported-windows-eperm',
+    });
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const hooksPath = join(codexDir, 'hooks.json');
+        const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexDir);
+        await mkdir(codexDir, { recursive: true });
+        await mkdir(dirname(shimPath), { recursive: true });
+        await writeFile(configPath, buildOmxConfig());
+        await writeFile(
+          hooksPath,
+          `${JSON.stringify(buildManagedCodexHooksConfig(packageRoot(), {
+            platform: 'win32',
+            codexHomeDir: codexDir,
+          }), null, 2)}\n`,
+        );
+        await writeFile(shimPath, buildManagedCodexNativeHookWindowsShimContent(packageRoot()));
+        process.stderr.write = ((chunk: string | Uint8Array) => {
+          stderr.push(String(chunk));
+          return true;
+        }) as typeof process.stderr.write;
+
+        await uninstall({
+          scope: 'project',
+          transactionPlatform: 'win32',
+          regularFileSyncForTest: async () => 'synced',
+        });
+
+        assert.equal(existsSync(hooksPath), false);
+        assert.equal(existsSync(shimPath), false);
+        assert.deepEqual(
+          stderr.filter((line) => line.includes('native-hook uninstall')),
+          ['[omx] warning: Windows EPERM directory fsync unsupported in native-hook uninstall; operation succeeded with degraded durability.\n'],
+        );
+      });
+    } finally {
+      resetDurability();
       process.stderr.write = originalStderrWrite;
       await rm(wd, { recursive: true, force: true });
     }
