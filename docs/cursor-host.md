@@ -2,6 +2,8 @@
 
 `omx cursor` is the OMX-owned surface for **Cursor Agent** as a second host. It is not `omx adapt` (OpenClaw/Hermes/Herdr observation under `.omx/adapters/<target>/`), and it is not the VS Code/Cursor extension (`omx --direct` launcher).
 
+**Repository boundary:** this clone (`sesquicadaver/oh-my-codex-cursor`) is not an upstream contribution surface. Do not open pull requests against [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex) from this work.
+
 Cursor Agent can follow filesystem `SKILL.md` files. It does not run Codex `UserPromptSubmit` keyword routing, Stop-hook continuation, Codex `/goal` + `agent_type`, team tmux, or HUD layer 1.
 
 ## Contract

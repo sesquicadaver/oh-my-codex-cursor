@@ -1,5 +1,7 @@
 # oh-my-codex (OMX)
 
+> **This repository is a standalone Cursor-host clone (`oh-my-codex-cursor`). Do not merge it into [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex).** The official OMX project remains that upstream repo and the `oh-my-codex` npm package.
+
 <p align="center">
   <img src="https://yeachan-heo.github.io/oh-my-codex-website/omx-character-nobg.png" alt="oh-my-codex character" width="280">
   <br>
