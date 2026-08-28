@@ -93,4 +93,22 @@ describe("cursor-host skill classification", () => {
 			renderCursorHostOverlayRule(),
 		);
 	});
+
+	it("keeps the in-repo Cursor project overlay in sync with the renderer", () => {
+		const root = getPackageRoot();
+		assert.equal(
+			readFileSync(
+				join(root, ".cursor", "skills", "omx-cursor-host", "SKILL.md"),
+				"utf8",
+			),
+			renderCursorHostOverlaySkill(),
+		);
+		assert.equal(
+			readFileSync(
+				join(root, ".cursor", "rules", "omx-cursor-host.mdc"),
+				"utf8",
+			),
+			renderCursorHostOverlayRule(),
+		);
+	});
 });

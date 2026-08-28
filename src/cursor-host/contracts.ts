@@ -71,6 +71,8 @@ export interface CursorHostPaths {
 	projectSkillsDir: string;
 }
 
+export type CursorHostInstallMode = "legacy" | "plugin";
+
 export interface CursorHostContext {
 	cwd: string;
 	homedir: string;
@@ -81,6 +83,7 @@ export interface CursorHostContext {
 	force: boolean;
 	now: Date;
 	omxCommand: string;
+	installMode?: CursorHostInstallMode;
 }
 
 export interface CursorSkillLinkPlan {
