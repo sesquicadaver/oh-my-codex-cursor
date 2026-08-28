@@ -10020,6 +10020,7 @@ const OMX_NESTED_HELP_COMMANDS = new Set([
   "auth",
   "capabilities",
   "cleanup",
+  "cursor",
   "deepinit",
   "explore",
   "hooks",

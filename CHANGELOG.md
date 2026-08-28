@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Cursor host CLI** — `omx cursor init|status|doctor` installs filesystem skill symlinks, an OMX-owned Cursor overlay, and a safe `omx_trace` MCP merge without registering `omx_state` or `omx_hermes`.
+
 ## [0.20.5] - 2026-08-10
 
 Patch release for the exact 68-commit range `v0.20.4..13c08f84cb6c27750b8f5c4a4d5105faad074196`. No intentional breaking CLI or package-layout changes.

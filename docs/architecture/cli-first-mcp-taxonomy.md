@@ -63,6 +63,7 @@ A surface marked canonical should provide:
 | Code intelligence | Read-only inspection | CLI/code-intel command surfaces where available | Optional integration | CLI diagnostics/search where available | Failures should not affect runtime lifecycle; fall back to CLI or local static checks. |
 | Shared MCP registry sync | Setup-time integration config | `omx setup` with explicit MCP compatibility mode/preferences | Optional setup integration | `omx setup --mcp compat` when MCP sync is desired | No-MCP setup mode should omit first-party MCP blocks while preserving user-authored MCP servers. |
 | First-party MCP servers | Optional integration | `omx mcp-serve <target>` for explicitly enabled clients | Optional compatibility/integration | Matching CLI/JSON command for durable operations | Keep servers available for opt-in clients; do not make them required for runtime-critical recovery. |
+| Cursor Agent host | Optional editor host | `omx cursor init\|status\|doctor` plus CLI/JSON | Safe default: `omx_trace` only; `omx_wiki` opt-in | Same `omx … --json` commands | Never register `omx_state` or `omx_hermes` in Cursor. Unset `OMX_SESSION_ID` would write into a live Codex session. |
 
 ## Setup and migration posture
 

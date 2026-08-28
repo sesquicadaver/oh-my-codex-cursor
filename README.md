@@ -464,6 +464,7 @@ If this happens, try:
 
 ## Documentation
 
+- [Cursor host (`omx cursor`)](./docs/cursor-host.md)
 - [Getting Started](./docs/getting-started.html)
 - [Demo guide](./DEMO.md)
 - [Wiki feature](./docs/wiki-feature.md)
