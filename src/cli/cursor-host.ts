@@ -13,6 +13,7 @@ import {
 	buildCursorHostStatus,
 	initCursorHost,
 } from "../cursor-host/index.js";
+import { readPersistedSetupPreferencesSync } from "./setup-preferences.js";
 import { codexHome } from "../utils/paths.js";
 
 export const CURSOR_HOST_HELP = [
@@ -54,6 +55,7 @@ export interface CursorHostCommandDependencies {
 	codexHome?: string;
 	omxCommand?: string;
 	now?: Date;
+	installMode?: CursorHostContext["installMode"];
 	stdout?: (line: string) => void;
 }
 
@@ -223,8 +225,10 @@ export async function cursorHostCommand(
 		throw new Error("--force is only supported with omx cursor init");
 	}
 
+	const cwd = deps.cwd ?? process.cwd();
+	const persisted = readPersistedSetupPreferencesSync(cwd);
 	const context: CursorHostContext = {
-		cwd: deps.cwd ?? process.cwd(),
+		cwd,
 		homedir: deps.homedir ?? homedir(),
 		codexHome: deps.codexHome ?? codexHome(),
 		scope: parsed.scope,
@@ -233,6 +237,11 @@ export async function cursorHostCommand(
 		force: parsed.force,
 		now: deps.now ?? new Date(),
 		omxCommand: deps.omxCommand ?? "omx",
+		installMode:
+			deps.installMode ??
+			(persisted?.installMode === "plugin" || persisted?.installMode === "legacy"
+				? persisted.installMode
+				: undefined),
 	};
 
 	switch (parsed.subcommand as CursorHostSubcommand) {

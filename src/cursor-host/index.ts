@@ -18,6 +18,7 @@ export {
 	type CursorHostDoctorIssue,
 	type CursorHostDoctorReport,
 	type CursorHostInitResult,
+	type CursorHostInstallMode,
 	type CursorHostPaths,
 	type CursorHostScope,
 	type CursorHostStatusReport,
@@ -47,3 +48,4 @@ export {
 export { initCursorHost } from "./init.js";
 export { buildCursorHostStatus } from "./status.js";
 export { buildCursorHostDoctor } from "./doctor.js";
+export { isCursorHostInUse } from "./presence.js";

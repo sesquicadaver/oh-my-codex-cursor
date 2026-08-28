@@ -17,7 +17,7 @@ import { constants, existsSync, readFileSync, type Stats } from "fs";
 import { access, chown, lstat, mkdtemp, readdir, readFile, rmdir, rm } from "fs/promises";
 import { spawnSync } from "child_process";
 import { basename, dirname, join, relative } from "path";
-import { tmpdir } from "os";
+import { tmpdir, homedir } from "os";
 import {
 	codexHome,
 	codexConfigPath,
@@ -93,6 +93,7 @@ import {
 	resolvePackagedOmxMarketplace,
 } from "./plugin-marketplace.js";
 import { hasOmxAgentsContract } from "../utils/agents-md.js";
+import { checkCursorHost } from "./doctor-cursor-host.js";
 import {
 	OMX_DEFAULT_SPARK_MODEL_ENV,
 	OMX_SPARK_MODEL_ENV,
@@ -729,6 +730,15 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 			scopeResolution.installMode,
 			scopeResolution.mcpMode,
 		),
+	);
+
+	checks.push(
+		checkCursorHost({
+			cwd,
+			homedir: homedir(),
+			codexHome: paths.codexHomeDir,
+			installMode: scopeResolution.installMode,
+		}),
 	);
 
 	// Check 10: Prompt triage

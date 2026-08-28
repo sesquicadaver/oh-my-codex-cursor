@@ -21,7 +21,9 @@ Matrix of product requirements → module → tests for `omx cursor`. Update thi
 | `status` / `doctor` report missing links, broken links, unsafe MCP | `src/cursor-host/status.ts`, `src/cursor-host/doctor.ts` | doctor unsafe MCP | covered |
 | Nested `omx cursor --help` is command-local | `src/cli/index.ts` `NESTED_HELP_COMMANDS` | `nested-help-routing.test.ts`, `cursor-host-help.test.ts` | covered |
 | Codex native hook allows `omx cursor --help` | `src/scripts/codex-native-hook.ts` | nested-help allowlist includes `cursor` | covered |
-| No keyword-detector / VSIX core bundle / state+hermes MCP in this cycle | (intentionally absent) | overlay forbids state/hermes | covered |
+| `omx doctor` includes Cursor host health | `src/cli/doctor-cursor-host.ts`, `src/cli/doctor.ts` | `src/cli/__tests__/doctor-cursor-host.test.ts` | covered |
+| Plugin mode fails the filesystem skill bridge | `src/cursor-host/doctor.ts` | `src/cursor-host/__tests__/doctor-plugin.test.ts` | covered |
+| In-repo `.cursor` overlay/rule/mcp for this clone | `.cursor/skills/omx-cursor-host/`, `.cursor/rules/`, `.cursor/mcp.json` | classification in-repo overlay sync | covered |
 
 ## Anti-stub
 

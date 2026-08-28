@@ -1,0 +1,12 @@
+---
+description: OMX Cursor host — Cursor Agent is a second host, not Codex runtime
+alwaysApply: true
+---
+
+# OMX Cursor host
+
+- Cursor Agent is not Codex CLI. Do not emulate `$autopilot`, `$ralph`, `$ultrawork`, `$team`, `$ultraqa`, or `$pipeline` as Cursor-native loops.
+- Durable operations go through `omx … --json`. MCP is optional; default Cursor MCP is `omx_trace` only.
+- Never add `omx_state` or `omx_hermes` to Cursor MCP. Do not mutate live Codex session state from Cursor.
+- Host-safe OMX skills may be followed as instruction text. Runtime-gated skills require the OMX CLI/tmux host.
+- Install and repair this overlay with `omx cursor init --write`; inspect with `omx cursor doctor`.

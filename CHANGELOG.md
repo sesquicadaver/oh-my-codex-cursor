@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
-- **Cursor host CLI** — `omx cursor init|status|doctor` installs filesystem skill symlinks, an OMX-owned Cursor overlay, and a safe `omx_trace` MCP merge without registering `omx_state` or `omx_hermes`. This clone is a standalone Cursor-host repository and is not for merge into upstream `Yeachan-Heo/oh-my-codex`.
+- **Cursor host CLI** — `omx cursor init|status|doctor` installs filesystem skill symlinks, an OMX-owned Cursor overlay, and a safe `omx_trace` MCP merge without registering `omx_state` or `omx_hermes`. This clone is a standalone Cursor-host repository and is not for merge into upstream `Yeachan-Heo/oh-my-codex`. `omx doctor` reports Cursor-host health and fails plugin-mode setups that archive the filesystem skill bridge.
 
 ## [0.20.5] - 2026-08-10
 

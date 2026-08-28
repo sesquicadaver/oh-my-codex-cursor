@@ -81,3 +81,5 @@ Canonical loop remains `$deep-interview` → `$ralplan` → `$ultragoal` (+ `$te
 - Port keyword-detector into Cursor
 - Enable `omx_memory`, `omx_state`, or `omx_hermes` MCP
 - Claim plugin marketplace as Cursor skill discovery
+
+`omx doctor` on this fork includes a **Cursor host** check. Plugin-mode setup fails that check because it archives the filesystem skill bridge.

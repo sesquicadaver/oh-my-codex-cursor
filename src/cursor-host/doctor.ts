@@ -18,6 +18,15 @@ export function buildCursorHostDoctor(
 	const status = buildCursorHostStatus(context);
 	const issues: CursorHostDoctorIssue[] = [];
 
+	if (context.installMode === "plugin") {
+		issues.push({
+			code: "plugin_mode_blocks_filesystem_skills",
+			severity: "error",
+			message:
+				"Setup install mode is plugin; Codex plugin delivery archives ~/.codex/skills and Cursor Agent cannot discover OMX filesystem skills. Run omx setup --install-mode legacy, then omx cursor init --write.",
+		});
+	}
+
 	if (!existsSync(status.paths.userSkillsDir) && status.skills.sourceCount === 0) {
 		issues.push({
 			code: "omx_skills_dir_missing",
@@ -126,6 +135,11 @@ export function buildCursorHostDoctor(
 	if (status.mcp.unsafeServers.length > 0) {
 		nextSteps.push(
 			"Remove omx_state and omx_hermes from Cursor MCP. Use omx state / omx team from the CLI instead.",
+		);
+	}
+	if (context.installMode === "plugin") {
+		nextSteps.push(
+			"Switch OMX setup to legacy filesystem skills (`omx setup --install-mode legacy --force`) before Cursor bridging.",
 		);
 	}
 	if (issues.length === 0) {
