@@ -52,6 +52,7 @@ import { autoresearchGoalCommand } from "./autoresearch-goal.js";
 import { mcpParityCommand } from "./mcp-parity.js";
 import { mcpServeCommand } from "./mcp-serve.js";
 import { adaptCommand } from "./adapt.js";
+import { cursorHostCommand } from "./cursor-host.js";
 import { listCommand } from "./list.js";
 import { authCommand } from "./auth.js";
 import { missionCommand } from "./mission.js";
@@ -266,6 +267,7 @@ Usage:
   omx auth      Manage Codex OAuth auth slots (add|list|use)
   omx question  OMX-owned blocking question UI entrypoint for agent-invoked user questions
   omx adapt     Scaffold OMX-owned adapter foundations for persistent external targets
+  omx cursor    Install OMX filesystem skills and a host-safe overlay into Cursor Agent
   omx resume    Resume Codex sessions (supports --project and --codex-home <path>)
   omx explore   DEPRECATED compatibility command; use normal repo inspection or omx sparkshell
   omx api       Run native omx-api localhost gateway commands (serve|status|stop|generate)
@@ -444,6 +446,7 @@ type CliCommand =
   | "ask"
   | "question"
   | "adapt"
+  | "cursor"
   | "explore"
   | "api"
   | "sparkshell"
@@ -480,6 +483,7 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "cleanup",
   "auth",
   "adapt",
+  "cursor",
   "explore",
   "autoresearch",
   "autoresearch-goal",
@@ -3350,6 +3354,8 @@ export async function main(args: string[]): Promise<void> {
     "auth",
     "ask",
     "question",
+    "adapt",
+    "cursor",
     "autoresearch",
   "autoresearch-goal",
     "explore",
@@ -3474,6 +3480,9 @@ if (command !== "launch" && command !== "resume") {
         break;
       case "adapt":
         await adaptCommand(args.slice(1));
+        break;
+      case "cursor":
+        await cursorHostCommand(args.slice(1));
         break;
       case "cleanup":
         await cleanupCommand(args.slice(1));

@@ -22,6 +22,8 @@ Current targets:
 - `hermes`
 - `herdr`
 
+Cursor Agent is a different host. Use [`omx cursor`](./cursor-host.md), not `omx adapt cursor`.
+
 Hermes follow-on behavior in this worktree:
 
 - `probe` inspects external Hermes ACP, gateway, and session-store evidence
