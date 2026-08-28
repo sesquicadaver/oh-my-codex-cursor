@@ -10,7 +10,7 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
-- **Clone documentation identity** — README, CONTRIBUTING, HTML docs, Cursor-host pages, and localized README banners now follow the official OMX documentation style while naming this clone and linking the original repository. The official npm package and GitHub project remain `oh-my-codex` / `Yeachan-Heo/oh-my-codex`.
+- **Cursor-first README** — root README describes this clone as an OMX adaptation for Cursor Agent (`omx cursor`, skill fitness, two-host model) and links [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex) instead of inlining the official Codex-first operator manual.
 
 ## [0.20.5] - 2026-08-10
 

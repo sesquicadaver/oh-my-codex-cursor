@@ -119,14 +119,24 @@ describe('ultragoal docs contract', () => {
     assert.match(nativeHooksDoc, /keyword routing still takes precedence/i);
   });
 
-  it('documents deep-interview to ralplan to ultragoal as the README default workflow', () => {
+  it('documents the inherited OMX loop and Cursor-host split in README', () => {
     const readme = loadDoc('README.md');
 
-    assert.match(readme, /canonical default workflow with `\$deep-interview`, `\$ralplan`, and `\$ultragoal`/);
-    assert.match(readme, /standard workflow built around `\$deep-interview` -> `\$ralplan` -> `\$ultragoal`/);
-    assert.match(readme, /\$deep-interview "clarify the authentication change"[\s\S]*\$ralplan "approve the auth plan and review tradeoffs"[\s\S]*\$ultragoal "turn the approved plan into durable Codex goals"/);
-    assert.match(readme, /Use `\$team` inside that execution path only when a specific Ultragoal story needs coordinated parallel work/);
-    assert.match(readme, /Use `\$ralph` as an intentional alternate completion loop/);
+    assert.match(readme, /oh-my-codex-cursor/);
+    assert.match(readme, /omx cursor init --write/);
+    assert.match(readme, /\$deep-interview/);
+    assert.match(readme, /\$ralplan/);
+    assert.match(readme, /\$ultragoal/);
+    assert.match(readme, /host-safe/);
+    assert.match(readme, /runtime-gated/i);
+    assert.match(readme, /\$team/);
+    assert.match(readme, /\$ralph/);
+    assert.match(readme, /Yeachan-Heo\/oh-my-codex/);
+    assert.doesNotMatch(
+      readme,
+      /Liked OmX but find it a bit overkill/,
+      'README must not copy the official OMX hero callout',
+    );
   });
 
   it('documents Team as the parallel execution engine while leader owns Ultragoal checkpointing', () => {

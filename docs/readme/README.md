@@ -43,12 +43,11 @@ This folder is part of the Cursor-host clone [`sesquicadaver/oh-my-codex-cursor`
 
 ## Maintenance rules
 
-* Treat `../../README.md` as the canonical source.
+* Treat `../../README.md` as the canonical **Cursor-host** source for this clone.
+* Localized files in this folder still describe Codex-first official OMX; they are not translations of the Cursor-first root README until rewritten.
 * Add new README translations in this folder, not at the repository root.
-* Keep the language list synchronized between the canonical README and each localized variant.
 * Keep relative links valid from `docs/readme/`.
 * Prefer updating existing translations instead of introducing duplicate files or alternate naming schemes.
-* Preserve the plugin-mode AGENTS contract from the canonical README: persistent scope `AGENTS.md` is durable orchestration guidance, and session-scoped AGENTS files only add runtime overlays.
 
 ## Related docs
 

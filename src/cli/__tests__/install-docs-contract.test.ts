@@ -65,6 +65,14 @@ describe('install docs contract', () => {
     }
   });
 
+  it('treats root README as the Cursor-host install path', () => {
+    const readme = read('README.md');
+    assert.match(readme, /npm install -g \./);
+    assert.match(readme, /omx cursor init --write/);
+    assert.match(readme, /install-mode legacy/);
+    assert.match(readme, /does not include.{0,24}omx cursor/);
+  });
+
   it('keeps primary install docs explicit about the Homebrew-owned binary conflict', () => {
     for (const surface of ['README.md', 'docs/getting-started.html']) {
       assert.match(

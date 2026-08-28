@@ -24,7 +24,7 @@ Matrix of product requirements → module → tests for `omx cursor` in this clo
 | `omx doctor` includes Cursor host health | `src/cli/doctor-cursor-host.ts`, `src/cli/doctor.ts` | `src/cli/__tests__/doctor-cursor-host.test.ts` | covered |
 | Plugin mode fails the filesystem skill bridge | `src/cursor-host/doctor.ts` | `src/cursor-host/__tests__/doctor-plugin.test.ts` | covered |
 | In-repo `.cursor` overlay/rule/mcp for this clone | `.cursor/skills/omx-cursor-host/`, `.cursor/rules/`, `.cursor/mcp.json` | classification in-repo overlay sync | covered |
-| Clone docs name this repo and link official OMX | `README.md`, `docs/cursor-host.md`, `CONTRIBUTING.md` | documentation identity; overlay renderer | covered |
+| Clone README is Cursor-first adaptation, not a copy of official OMX | `README.md` | `src/ultragoal/__tests__/docs-contract.test.ts`, `src/cli/__tests__/install-docs-contract.test.ts` | covered |
 
 ## Anti-stub
 
