@@ -1,7 +1,5 @@
 # oh-my-codex (OMX)
 
-> **This repository is a standalone Cursor-host clone (`oh-my-codex-cursor`). Do not merge it into [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex).** The official OMX project remains that upstream repo and the `oh-my-codex` npm package.
-
 <p align="center">
   <img src="https://yeachan-heo.github.io/oh-my-codex-website/omx-character-nobg.png" alt="oh-my-codex character" width="280">
   <br>
@@ -15,18 +13,23 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
 [![Discord](https://img.shields.io/discord/1452487457085063218?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/jq6jnSGABY)
+[![GitHub](https://img.shields.io/badge/GitHub-oh--my--codex--cursor-181717?logo=github)](https://github.com/sesquicadaver/oh-my-codex-cursor)
 
 **Website:** https://yeachan-heo.github.io/oh-my-codex-website/
 
-**Docs:** [Getting Started](./docs/getting-started.html) · [Agents](./docs/agents.html) · [Skills](./docs/skills.html) · [Integrations](./docs/integrations.html) · [Demo](./DEMO.md) · [OpenClaw guide](./docs/openclaw-integration.md)
+**Docs:** [Cursor host](./docs/cursor-host.md) · [Getting Started](./docs/getting-started.html) · [Agents](./docs/agents.html) · [Skills](./docs/skills.html) · [Integrations](./docs/integrations.html) · [Demo](./DEMO.md) · [OpenClaw guide](./docs/openclaw-integration.md)
 
 **Community:** [Discord](https://discord.gg/jq6jnSGABY) — shared OMX/community server for oh-my-codex and related tooling.
 
-## Official project and package
+## This clone and the official project
 
-The official/original OMX project is this repository, [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex), and the official npm package for this project is [`oh-my-codex`](https://www.npmjs.com/package/oh-my-codex). Install this project with `npm install -g oh-my-codex` (or alongside Codex CLI as shown below).
+This repository is [`sesquicadaver/oh-my-codex-cursor`](https://github.com/sesquicadaver/oh-my-codex-cursor), a **standalone Cursor Agent host** of OMX. It keeps the official Codex CLI orchestration layer and adds `omx cursor` so Cursor Agent can use filesystem skills, an OMX-owned overlay, and a host-safe `omx_trace` MCP merge.
 
-Third-party projects or forks that use names such as “OMX v2” are not official continuations, replacements, or release lines for this repository unless this README or the docs explicitly say so. When in doubt, trust this repository and the `oh-my-codex` package as the official install target.
+The official/original OMX project is [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex). The official npm package is [`oh-my-codex`](https://www.npmjs.com/package/oh-my-codex). Install the official Codex-first product with `npm install -g oh-my-codex` (or alongside Codex CLI as shown below).
+
+This clone is not an official continuation, npm release line, or upstream pull-request surface. Do not open pull requests against [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex) from this work, and do not merge this clone into upstream. Native release assets still come from the official GitHub repository; `package.json` `repository` stays pointed there on purpose.
+
+Third-party projects or forks that use names such as “OMX v2” are not official continuations, replacements, or release lines for OMX unless the official README or docs explicitly say so. When in doubt, trust [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex) and the `oh-my-codex` package as the official install target.
 
 OMX is a workflow layer for [OpenAI Codex CLI](https://github.com/openai/codex).
 
@@ -135,6 +138,28 @@ Use OMX if you already like Codex and want a better day-to-day runtime around it
 - durable state under `.omx/` for plans, logs, memory, and mode tracking
 
 If you want plain Codex with no extra workflow layer, you probably do not need OMX.
+
+## Cursor Agent host
+
+Cursor Agent is a **second host**, not a replacement for Codex CLI. It can follow filesystem `SKILL.md` files. It does not run Codex `UserPromptSubmit` keyword routing, Stop-hook continuation, Codex `/goal` + `agent_type`, team tmux, or HUD layer 1.
+
+If you want the Cursor-host path from this clone:
+
+```bash
+git clone https://github.com/sesquicadaver/oh-my-codex-cursor.git
+cd oh-my-codex-cursor
+npm install
+npm run build
+npm install -g .
+omx setup --scope user --install-mode legacy
+omx cursor init --write
+omx cursor doctor
+omx doctor
+```
+
+Use `omx cursor status --json` to inspect overlay, skill links, and MCP evidence. Prefer host-safe skills as instruction text and `omx … --json` for durable operations. Runtime-gated skills (`$autopilot`, `$ralph`, `$ultrawork`, `$team`, `$ultraqa`, `$pipeline`) still need an OMX CLI/tmux session.
+
+The VS Code/Cursor VSIX in `packages/vscode-extension` remains an `omx --direct` launcher. It is not Cursor Agent interop. Full contract: [`docs/cursor-host.md`](./docs/cursor-host.md). Living specification: [`docs/cursor-host-tz-matrix.md`](./docs/cursor-host-tz-matrix.md).
 
 ## Quick start
 
@@ -319,6 +344,7 @@ Most users should think of OMX as **better task routing + better workflow + bett
 6. Use `$deep-interview "..."` when the request or boundaries are still unclear
 7. Use `$ralplan "..."` to approve the plan and review tradeoffs
 8. Use `$ultragoal`, `$ultrawork`, `$autopilot`, or `$ralph` when the task needs an execution spine; add `/goal` when durable objective/checkpoint structure should be explicit
+9. For Cursor Agent on this clone, keep plugin-mode setup off, then run `omx cursor init --write` and `omx cursor doctor` as documented in [`docs/cursor-host.md`](./docs/cursor-host.md)
 
 ## Recommended workflow
 
@@ -508,6 +534,8 @@ If this happens, try:
 | Maintainer | Valeriy Pavlovich | [@iqdoctor](https://github.com/iqdoctor) |
 
 ## Star History
+
+Official OMX star history for [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex):
 
 [![Star History Chart](https://api.star-history.com/svg?repos=Yeachan-Heo/oh-my-codex&type=date&legend=top-left)](https://www.star-history.com/#Yeachan-Heo/oh-my-codex&type=date&legend=top-left)
 

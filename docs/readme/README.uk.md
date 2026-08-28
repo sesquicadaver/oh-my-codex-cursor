@@ -1,5 +1,11 @@
 # oh-my-codex (OMX)
 
+<table>
+<tr>
+<td><strong>Цей переклад належить Cursor-host клону</strong> <a href="https://github.com/sesquicadaver/oh-my-codex-cursor"><code>sesquicadaver/oh-my-codex-cursor</code></a>. Офіційний проєкт OMX — <a href="https://github.com/Yeachan-Heo/oh-my-codex"><code>Yeachan-Heo/oh-my-codex</code></a>, офіційний npm-пакет — <a href="https://www.npmjs.com/package/oh-my-codex"><code>oh-my-codex</code></a>. Канонічний англійський README: <a href="../../README.md">../../README.md</a>.</td>
+</tr>
+</table>
+
 <p align="center">
   <img src="https://yeachan-heo.github.io/oh-my-codex-website/omx-character-nobg.png" alt="oh-my-codex character" width="280">
   <br>
@@ -12,10 +18,28 @@
 [![Discord](https://img.shields.io/discord/1452487457085063218?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/jq6jnSGABY)
 
 **Вебсайт:** https://yeachan-heo.github.io/oh-my-codex-website/
-**Документація:** [Початок роботи](../getting-started.html) · [Агенти](../agents.html) · [Навички](../skills.html) · [Інтеграції](../integrations.html) · [Demo](../../DEMO.md) · [Посібник OpenClaw](../openclaw-integration.uk.md)
+**Документація:** [Cursor host](../cursor-host.md) · [Початок роботи](../getting-started.html) · [Агенти](../agents.html) · [Навички](../skills.html) · [Інтеграції](../integrations.html) · [Demo](../../DEMO.md) · [Посібник OpenClaw](../openclaw-integration.uk.md)
 **Спільнота:** [Discord](https://discord.gg/jq6jnSGABY) — спільний сервер OMX/спільноти для oh-my-codex та суміжних інструментів.
 
 OMX — це шар робочих процесів для [OpenAI Codex CLI](https://github.com/openai/codex).
+
+## Cursor Agent host
+
+Cursor Agent — другий хост, не заміна Codex CLI. Шлях цього клону:
+
+```bash
+git clone https://github.com/sesquicadaver/oh-my-codex-cursor.git
+cd oh-my-codex-cursor
+npm install
+npm run build
+npm install -g .
+omx setup --scope user --install-mode legacy
+omx cursor init --write
+omx cursor doctor
+```
+
+Повний контракт: [`docs/cursor-host.md`](../cursor-host.md). Офіційний OMX: [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex).
+
 
 Він залишає Codex рушієм виконання й допомагає:
 - запускати потужнішу сесію Codex за замовчуванням

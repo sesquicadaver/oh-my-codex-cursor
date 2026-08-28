@@ -2,6 +2,10 @@
 
 Thanks for contributing.
 
+This repository is the Cursor-host clone [`sesquicadaver/oh-my-codex-cursor`](https://github.com/sesquicadaver/oh-my-codex-cursor). The official OMX project is [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex). Official contributing guidance lives there: [`CONTRIBUTING.md`](https://github.com/Yeachan-Heo/oh-my-codex/blob/main/CONTRIBUTING.md).
+
+Do not open pull requests against [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex) from this clone.
+
 ## Development setup
 
 - Node.js >= 20
@@ -69,9 +73,10 @@ If `node_modules` is already fresh and you are iterating locally, you can skip `
 ## Project structure
 
 - `src/` -- TypeScript source (CLI, config, agents, MCP servers, hooks, modes, team, verification)
+- `src/cursor-host/` -- Cursor Agent host (`omx cursor`) for this clone only
 - `prompts/` -- agent prompt markdown files (installed to `~/.codex/prompts/`)
 - `skills/` -- skill directories with `SKILL.md` (installed to `~/.codex/skills/`)
-- `templates/` -- `AGENTS.md` orchestration brain template
+- `templates/` -- `AGENTS.md` orchestration brain template plus `templates/cursor-host/` overlay copies
 
 ### Adding a new agent prompt
 
@@ -110,6 +115,9 @@ Current mapped refresh examples:
   `docs/codex-native-hooks.md` or a document-refresh-scoped planning/spec file.
 - CLI/operator behavior (`src/cli/**`) should refresh `README.md`,
   `docs/getting-started.html`, or a relevant planning/spec file.
+- Cursor-host behavior (`src/cursor-host/**`, `src/cli/cursor-host.ts`,
+  `src/cli/doctor-cursor-host.ts`) should refresh `docs/cursor-host.md` and
+  `docs/cursor-host-tz-matrix.md`.
 - Prompt-guidance behavior (`src/hooks/**` rule-owned guidance surfaces) should
   refresh `docs/prompt-guidance-contract.md` or a relevant planning/spec file.
 
@@ -130,10 +138,11 @@ Document-refresh: not-needed | <reason>
 
 ## Workflow
 
-1. Create a branch from `dev` for normal contributions.
+1. Create a branch from `main` of this clone for normal contributions.
 2. Make focused changes.
 3. Run lint, build, and tests locally.
-4. Open a pull request targeting `dev` using the provided template. Use `main` only for maintainer-directed exceptions.
+4. Open a pull request against [`sesquicadaver/oh-my-codex-cursor`](https://github.com/sesquicadaver/oh-my-codex-cursor) targeting `main`.
+5. Do not target [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex). The official project uses `dev` as its normal contribution base; that workflow does not apply here.
 
 ## Commit style
 
@@ -161,4 +170,6 @@ docs: clarify setup steps for Codex CLI users
 
 ## Reporting issues
 
-Use the GitHub issue templates for bug reports and feature requests, including reproduction steps and expected behavior.
+Use the GitHub issue templates in this clone for Cursor-host bugs and clone-specific feature requests.
+
+File official OMX bugs and features against [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex/issues), not here.

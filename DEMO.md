@@ -1,5 +1,7 @@
 # oh-my-codex Demo Guide
 
+This file is the official OMX demo path. Clone [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex) for that walkthrough. This Cursor-host clone is [`sesquicadaver/oh-my-codex-cursor`](https://github.com/sesquicadaver/oh-my-codex-cursor); Cursor Agent setup is in [`docs/cursor-host.md`](./docs/cursor-host.md).
+
 ## Prerequisites
 
 - Node.js >= 20

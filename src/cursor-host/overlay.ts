@@ -77,6 +77,8 @@ Prefer filesystem skills via \`omx cursor init --write\` (legacy Codex skill dir
 ## Owned install
 
 This overlay is written by \`omx cursor init --write\`. Check health with \`omx cursor status --json\` and \`omx cursor doctor --json\`.
+
+This clone is a Cursor-host overlay of OMX, not the official Codex-first project. Official OMX: https://github.com/Yeachan-Heo/oh-my-codex. This repository: https://github.com/sesquicadaver/oh-my-codex-cursor.
 `;
 }
 
@@ -93,5 +95,6 @@ alwaysApply: true
 - Never add \`omx_state\` or \`omx_hermes\` to Cursor MCP. Do not mutate live Codex session state from Cursor.
 - Host-safe OMX skills may be followed as instruction text. Runtime-gated skills require the OMX CLI/tmux host.
 - Install and repair this overlay with \`omx cursor init --write\`; inspect with \`omx cursor doctor\`.
+- Official OMX remains https://github.com/Yeachan-Heo/oh-my-codex. This clone is https://github.com/sesquicadaver/oh-my-codex-cursor and must not be merged into upstream.
 `;
 }

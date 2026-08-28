@@ -1,5 +1,11 @@
 # oh-my-codex (OMX)
 
+<table>
+<tr>
+<td><strong>This translation belongs to the Cursor-host clone</strong> <a href="https://github.com/sesquicadaver/oh-my-codex-cursor"><code>sesquicadaver/oh-my-codex-cursor</code></a>. The official OMX project is <a href="https://github.com/Yeachan-Heo/oh-my-codex"><code>Yeachan-Heo/oh-my-codex</code></a> and the official npm package is <a href="https://www.npmjs.com/package/oh-my-codex"><code>oh-my-codex</code></a>. Canonical English README: <a href="../../README.md">../../README.md</a>.</td>
+</tr>
+</table>
+
 <p align="center">
   <img src="https://yeachan-heo.github.io/oh-my-codex-website/omx-character-nobg.png" alt="oh-my-codex character" width="280">
   <br>
@@ -11,7 +17,7 @@
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
 [![Discord](https://img.shields.io/discord/1452487457085063218?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/jq6jnSGABY)
 
-> **[官方網站](https://yeachan-heo.github.io/oh-my-codex-website/)** | **[說明文件](https://yeachan-heo.github.io/oh-my-codex-website/docs.html)** | **[CLI 參考手冊](https://yeachan-heo.github.io/oh-my-codex-website/docs.html#cli-reference)** | **[工作流程](https://yeachan-heo.github.io/oh-my-codex-website/docs.html#workflows)** | **[OpenClaw 整合指南](../openclaw-integration.zh-TW.md)** | **[GitHub](https://github.com/Yeachan-Heo/oh-my-codex)** | **[npm](https://www.npmjs.com/package/oh-my-codex)**
+> **[官方網站](https://yeachan-heo.github.io/oh-my-codex-website/)** | **[說明文件](https://yeachan-heo.github.io/oh-my-codex-website/docs.html)** | **[CLI 參考手冊](https://yeachan-heo.github.io/oh-my-codex-website/docs.html#cli-reference)** | **[工作流程](https://yeachan-heo.github.io/oh-my-codex-website/docs.html#workflows)** | **[OpenClaw 整合指南](../openclaw-integration.zh-TW.md)** | **[GitHub](https://github.com/Yeachan-Heo/oh-my-codex)** | **[This clone](https://github.com/sesquicadaver/oh-my-codex-cursor)** | **[npm](https://www.npmjs.com/package/oh-my-codex)**
 
 [OpenAI Codex CLI](https://github.com/openai/codex) 的多智能體編排層。
 

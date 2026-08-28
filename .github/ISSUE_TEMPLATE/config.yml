@@ -1,5 +1,11 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Official OMX project
+    url: https://github.com/Yeachan-Heo/oh-my-codex
+    about: The official Codex-first OMX repository. File upstream bugs and features there, not on this Cursor-host clone.
+  - name: Official OMX issues
+    url: https://github.com/Yeachan-Heo/oh-my-codex/issues
+    about: Use official issue templates for OMX CLI, tmux, HUD, team, and npm-package problems.
   - name: Questions and usage help
     url: https://yeachan-heo.github.io/oh-my-codex-website/
-    about: For oh-my-codex usage questions, start with the OMX docs and guides.
+    about: For oh-my-codex usage questions, start with the official OMX docs and guides.

@@ -1,9 +1,11 @@
 # Oh My Codex VS Code Extension
 
-The Oh My Codex VS Code extension is the editor-facing UI for OMX. It gives a
-workspace a local Chat surface for launching direct OMX sessions, watching
+The Oh My Codex VS Code extension is the editor-facing UI for OMX **direct sessions**. It gives a
+workspace a local Chat surface for launching `omx --direct` sessions, watching
 session output, reopening recent logs, and running quick health checks without
 switching to a terminal pane.
+
+This package lives in the Cursor-host clone [`sesquicadaver/oh-my-codex-cursor`](https://github.com/sesquicadaver/oh-my-codex-cursor). Official OMX is [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex). The VSIX is **not** Cursor Agent interop; for filesystem skills and the host overlay use [`omx cursor`](../../docs/cursor-host.md).
 
 ![OMX VS Code extension UI preview](./resources/omx-chat-preview.svg)
 

@@ -84,3 +84,5 @@ Prefer filesystem skills via `omx cursor init --write` (legacy Codex skill direc
 ## Owned install
 
 This overlay is written by `omx cursor init --write`. Check health with `omx cursor status --json` and `omx cursor doctor --json`.
+
+This clone is a Cursor-host overlay of OMX, not the official Codex-first project. Official OMX: https://github.com/Yeachan-Heo/oh-my-codex. This repository: https://github.com/sesquicadaver/oh-my-codex-cursor.

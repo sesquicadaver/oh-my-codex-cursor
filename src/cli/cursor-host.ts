@@ -22,6 +22,7 @@ export const CURSOR_HOST_HELP = [
 	"Install OMX filesystem skills and a host-safe overlay into Cursor Agent.",
 	"This is not omx adapt: adapt observes OpenClaw/Hermes/Herdr under .omx/adapters/.",
 	"Cursor Agent is a second host. Runtime-gated OMX modes still require OMX CLI/tmux.",
+	"Official OMX: https://github.com/Yeachan-Heo/oh-my-codex. This clone: https://github.com/sesquicadaver/oh-my-codex-cursor.",
 	"",
 	"Subcommands:",
 	"  init      Preview or write skill symlinks, omx-cursor-host overlay, and safe MCP merge",

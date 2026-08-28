@@ -4,6 +4,8 @@ Issue #2214 establishes a runtime-support boundary for OMX: **CLI/JSON is the ca
 
 This page is intentionally a taxonomy and recovery guide. It does not change setup defaults, remove first-party MCP servers, or deprecate compatibility surfaces by itself.
 
+This clone ([`sesquicadaver/oh-my-codex-cursor`](https://github.com/sesquicadaver/oh-my-codex-cursor)) adds a Cursor Agent host row. Official OMX remains [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex).
+
 ## Contract levels
 
 | Level | Meaning | Support expectation |

@@ -1,6 +1,8 @@
 # Release Protocol
 
-This protocol is mandatory for every `oh-my-codex` release. It exists to prevent release notes, changelogs, and GitHub release bodies from understating the actual shipped compare range.
+This protocol is mandatory for every official `oh-my-codex` release on [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex). It exists to prevent release notes, changelogs, and GitHub release bodies from understating the actual shipped compare range.
+
+This Cursor-host clone ([`sesquicadaver/oh-my-codex-cursor`](https://github.com/sesquicadaver/oh-my-codex-cursor)) does not publish the official npm package. Keep clone-specific Cursor-host notes in `CHANGELOG.md` Unreleased. Do not treat a clone merge as an official `oh-my-codex` version bump.
 
 ## 1. Freeze the release range before writing notes
 

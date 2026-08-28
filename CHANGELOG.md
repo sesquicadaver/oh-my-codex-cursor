@@ -6,7 +6,11 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
-- **Cursor host CLI** — `omx cursor init|status|doctor` installs filesystem skill symlinks, an OMX-owned Cursor overlay, and a safe `omx_trace` MCP merge without registering `omx_state` or `omx_hermes`. This clone is a standalone Cursor-host repository and is not for merge into upstream `Yeachan-Heo/oh-my-codex`. `omx doctor` reports Cursor-host health and fails plugin-mode setups that archive the filesystem skill bridge.
+- **Cursor host CLI** — `omx cursor init|status|doctor` installs filesystem skill symlinks, an OMX-owned Cursor overlay, and a safe `omx_trace` MCP merge without registering `omx_state` or `omx_hermes`. This clone is a standalone Cursor-host repository ([`sesquicadaver/oh-my-codex-cursor`](https://github.com/sesquicadaver/oh-my-codex-cursor)) and is not for merge into the official project ([`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex)). `omx doctor` reports Cursor-host health and fails plugin-mode setups that archive the filesystem skill bridge.
+
+### Changed
+
+- **Clone documentation identity** — README, CONTRIBUTING, HTML docs, Cursor-host pages, and localized README banners now follow the official OMX documentation style while naming this clone and linking the original repository. The official npm package and GitHub project remain `oh-my-codex` / `Yeachan-Heo/oh-my-codex`.
 
 ## [0.20.5] - 2026-08-10
 

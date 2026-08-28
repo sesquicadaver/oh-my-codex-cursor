@@ -1,10 +1,12 @@
 ---
 name: Bug report
-about: Report a reproducible problem in oh-my-codex
+about: Report a reproducible problem in this Cursor-host clone (not official OMX)
 title: "[Bug] "
 labels: bug
 assignees: ''
 ---
+
+> This tracker is [`sesquicadaver/oh-my-codex-cursor`](https://github.com/sesquicadaver/oh-my-codex-cursor). For official OMX, use [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex/issues).
 
 ## Summary
 

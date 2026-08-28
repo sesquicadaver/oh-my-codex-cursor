@@ -114,7 +114,7 @@ Fallback behavior when hook context is unavailable:
 - Keep the detailed keyword list in `src/hooks/keyword-registry.ts`; do not duplicate it here.
 
 Runtime workflows such as `autopilot`, `ralph`, `ultrawork`, `ultraqa`, `team`/`swarm`, and `ecomode` require OMX CLI runtime support. In Codex App, outside-tmux, or plain Codex sessions without OMX tmux runtime, explain that those workflows are not directly available there and continue with the nearest App-safe surface unless the user explicitly wants to launch OMX CLI from shell first.
-- Cursor Agent is a second host. It does not run Codex `UserPromptSubmit` keyword routing. Follow filesystem `SKILL.md` files and `omx … --json`; do not emulate runtime-gated loops. Bridge with `omx cursor init --write` and inspect with `omx cursor doctor`.
+- Cursor Agent is a second host. It does not run Codex `UserPromptSubmit` keyword routing. Follow filesystem `SKILL.md` files and `omx … --json`; do not emulate runtime-gated loops. Bridge with `omx cursor init --write` and inspect with `omx cursor doctor`. Official OMX: https://github.com/Yeachan-Heo/oh-my-codex. This clone: https://github.com/sesquicadaver/oh-my-codex-cursor.
 - When deep-interview is active in attached-tmux OMX CLI/runtime, ask each interview round via `omx question`; after launching `omx question` in a background terminal, wait for that terminal to finish and read the JSON answer before continuing; preserve the leader pane with `OMX_QUESTION_RETURN_PANE=$TMUX_PANE` when invoking it through Bash/tool paths. Outside tmux or native surfaces that cannot render `omx question` should use the native structured question path when available; otherwise ask exactly one concise plain-text question and wait for the answer.
 
 </keyword_detection>

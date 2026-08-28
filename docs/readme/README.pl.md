@@ -1,5 +1,11 @@
 # oh-my-codex (OMX)
 
+<table>
+<tr>
+<td><strong>This translation belongs to the Cursor-host clone</strong> <a href="https://github.com/sesquicadaver/oh-my-codex-cursor"><code>sesquicadaver/oh-my-codex-cursor</code></a>. The official OMX project is <a href="https://github.com/Yeachan-Heo/oh-my-codex"><code>Yeachan-Heo/oh-my-codex</code></a> and the official npm package is <a href="https://www.npmjs.com/package/oh-my-codex"><code>oh-my-codex</code></a>. Canonical English README: <a href="../../README.md">../../README.md</a>.</td>
+</tr>
+</table>
+
 <p align="center">
   <img src="https://yeachan-heo.github.io/oh-my-codex-website/omx-character-nobg.png" alt="postać oh-my-codex" width="280">
   <br>

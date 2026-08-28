@@ -1,5 +1,11 @@
 # oh-my-codex (OMX)
 
+<table>
+<tr>
+<td><strong>This translation belongs to the Cursor-host clone</strong> <a href="https://github.com/sesquicadaver/oh-my-codex-cursor"><code>sesquicadaver/oh-my-codex-cursor</code></a>. The official OMX project is <a href="https://github.com/Yeachan-Heo/oh-my-codex"><code>Yeachan-Heo/oh-my-codex</code></a> and the official npm package is <a href="https://www.npmjs.com/package/oh-my-codex"><code>oh-my-codex</code></a>. Canonical English README: <a href="../../README.md">../../README.md</a>.</td>
+</tr>
+</table>
+
 <p align="center">
   <img src="https://yeachan-heo.github.io/oh-my-codex-website/omx-character-nobg.png" alt="oh-my-codex character" width="280">
   <br>
@@ -11,7 +17,7 @@
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
 [![Discord](https://img.shields.io/discord/1452487457085063218?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/jq6jnSGABY)
 
-> **[Website](https://yeachan-heo.github.io/oh-my-codex-website/)** | **[Documentation](https://yeachan-heo.github.io/oh-my-codex-website/docs.html)** | **[CLI Reference](https://yeachan-heo.github.io/oh-my-codex-website/docs.html#cli-reference)** | **[Workflows](https://yeachan-heo.github.io/oh-my-codex-website/docs.html#workflows)** | **[OpenClaw 통합 가이드](../openclaw-integration.ko.md)** | **[GitHub](https://github.com/Yeachan-Heo/oh-my-codex)** | **[npm](https://www.npmjs.com/package/oh-my-codex)**
+> **[Website](https://yeachan-heo.github.io/oh-my-codex-website/)** | **[Documentation](https://yeachan-heo.github.io/oh-my-codex-website/docs.html)** | **[CLI Reference](https://yeachan-heo.github.io/oh-my-codex-website/docs.html#cli-reference)** | **[Workflows](https://yeachan-heo.github.io/oh-my-codex-website/docs.html#workflows)** | **[OpenClaw 통합 가이드](../openclaw-integration.ko.md)** | **[GitHub](https://github.com/Yeachan-Heo/oh-my-codex)** | **[This clone](https://github.com/sesquicadaver/oh-my-codex-cursor)** | **[npm](https://www.npmjs.com/package/oh-my-codex)**
 
 [OpenAI Codex CLI](https://github.com/openai/codex)를 위한 멀티 에이전트 오케스트레이션 레이어.
 

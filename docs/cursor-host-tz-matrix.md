@@ -1,6 +1,6 @@
 # Cursor host living specification
 
-Matrix of product requirements → module → tests for `omx cursor`. Update this file when the Cursor-host surface changes.
+Matrix of product requirements → module → tests for `omx cursor` in this clone ([`sesquicadaver/oh-my-codex-cursor`](https://github.com/sesquicadaver/oh-my-codex-cursor)). Official OMX remains [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex). Update this file when the Cursor-host surface changes.
 
 | Requirement | Module | Tests | Status |
 | --- | --- | --- | --- |
@@ -24,6 +24,7 @@ Matrix of product requirements → module → tests for `omx cursor`. Update thi
 | `omx doctor` includes Cursor host health | `src/cli/doctor-cursor-host.ts`, `src/cli/doctor.ts` | `src/cli/__tests__/doctor-cursor-host.test.ts` | covered |
 | Plugin mode fails the filesystem skill bridge | `src/cursor-host/doctor.ts` | `src/cursor-host/__tests__/doctor-plugin.test.ts` | covered |
 | In-repo `.cursor` overlay/rule/mcp for this clone | `.cursor/skills/omx-cursor-host/`, `.cursor/rules/`, `.cursor/mcp.json` | classification in-repo overlay sync | covered |
+| Clone docs name this repo and link official OMX | `README.md`, `docs/cursor-host.md`, `CONTRIBUTING.md` | documentation identity; overlay renderer | covered |
 
 ## Anti-stub
 

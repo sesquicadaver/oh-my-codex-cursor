@@ -1,6 +1,6 @@
 # `omx adapt`
 
-`omx adapt <target>` is the OMX-owned surface for persistent external-agent adaptation.
+`omx adapt <target>` is the OMX-owned surface for persistent external-agent adaptation. This page lives in the Cursor-host clone ([`sesquicadaver/oh-my-codex-cursor`](https://github.com/sesquicadaver/oh-my-codex-cursor)); the official OMX project is [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex).
 
 Shared foundation behavior:
 
@@ -22,7 +22,7 @@ Current targets:
 - `hermes`
 - `herdr`
 
-Cursor Agent is a different host. Use [`omx cursor`](./cursor-host.md), not `omx adapt cursor`.
+Cursor Agent is a different host. Use [`omx cursor`](./cursor-host.md), not `omx adapt cursor`. That command exists on this clone; it is not part of the official npm package.
 
 Hermes follow-on behavior in this worktree:
 

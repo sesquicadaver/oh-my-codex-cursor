@@ -2,6 +2,8 @@
 
 This guide documents the public contract for turning GitHub or community reports into traceable OMX work packages, worktrees, pull requests, reviews, and merge decisions. It is intentionally infrastructure-neutral: repositories may implement the glue with GitHub Actions, bots, scheduled scripts, or manual maintainer commands, but the artifacts and gates below are the source of truth.
 
+This Cursor-host clone ([`sesquicadaver/oh-my-codex-cursor`](https://github.com/sesquicadaver/oh-my-codex-cursor)) targets `main`. Official OMX ([`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex)) uses `dev` as the normal contribution base described below. Do not send this clone's packages upstream.
+
 ## Public scope and source of truth
 
 - **Repo-available contract:** the Markdown templates in [`docs/pipeline/templates/`](./templates/) and this workflow contract are safe to copy, review, and version in the repository.

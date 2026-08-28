@@ -23,8 +23,9 @@
         <span class="badge">GitHub Pages</span>
         <h1>oh-my-codex</h1>
         <p>Multi-agent orchestration for OpenAI Codex CLI.</p>
-        <p><strong>Official project:</strong> <a href="https://github.com/Yeachan-Heo/oh-my-codex">Yeachan-Heo/oh-my-codex</a>. <strong>Official package:</strong> <a href="https://www.npmjs.com/package/oh-my-codex">oh-my-codex</a>. Third-party projects or forks using names such as “OMX v2” are not official continuations or release lines unless these docs explicitly say so.</p>
-        <pre><code>npm install -g oh-my-codex</code></pre>
+        <p><strong>This clone:</strong> <a href="https://github.com/sesquicadaver/oh-my-codex-cursor">sesquicadaver/oh-my-codex-cursor</a> is a standalone Cursor Agent host. <strong>Official project:</strong> <a href="https://github.com/Yeachan-Heo/oh-my-codex">Yeachan-Heo/oh-my-codex</a>. <strong>Official package:</strong> <a href="https://www.npmjs.com/package/oh-my-codex">oh-my-codex</a>. This clone is not an official continuation or npm release line.</p>
+        <pre><code>npm install -g oh-my-codex   # official Codex-first install
+# Cursor host lives in this clone: npm install &amp;&amp; npm run build &amp;&amp; npm install -g .</code></pre>
         <p>Real global version bumps now print an explicit reminder instead of auto-launching <code>omx setup</code>. When you're ready, run <code>omx setup</code> manually or use <code>omx update</code> to check npm and then run the same setup refresh path. Launch-time update checks are throttled and prompt by default; set <code>OMX_AUTO_UPDATE=0</code> to disable them or <code>OMX_AUTO_UPDATE=defer</code> to schedule deferred updates without prompting. Fresh setup leaves <code>model_context_window</code> and <code>model_auto_compact_token_limit</code> unset so Codex uses the active model defaults. Rerunning setup removes only unchanged legacy values proven to have been seeded by OMX and preserves explicit, unmarked, and edited values.</p>
       </section>
 
@@ -69,7 +70,7 @@
 
       <h2>Quick Start</h2>
       <ol>
-        <li><code>npm install -g oh-my-codex</code></li>
+        <li><code>npm install -g oh-my-codex</code> for the official Codex-first path, or install this clone from source when you need <code>omx cursor</code>.</li>
         <li>After install or real version bumps, run <code>omx setup</code> yourself when you're ready, or use <code>omx update</code> when you also want npm to update OMX first.</li>
         <li><code>omx doctor</code></li>
         <li><code>omx --xhigh --madmax</code> (trusted environments) or <code>omx</code></li>
@@ -77,6 +78,7 @@
 
       <h2>Reference Guides</h2>
       <ul>
+        <li><a href="./cursor-host.md">Cursor host (<code>omx cursor</code>)</a></li>
         <li><a href="./architecture/cli-first-mcp-taxonomy.md">CLI-first MCP taxonomy and recovery matrix</a></li>
         <li><a href="./reference/omx-config-schema-routing.md">.omx-config.json model/env routing reference</a></li>
         <li><a href="./pipeline/github-pr-package-identity.md">GitHub / PR / package identity pipeline</a></li>
@@ -115,7 +117,7 @@
 
     <footer>
       <div class="container">
-        <span class="muted">GitHub: <a href="https://github.com/Yeachan-Heo/oh-my-codex">Yeachan-Heo/oh-my-codex</a></span>
+        <span class="muted">This clone: <a href="https://github.com/sesquicadaver/oh-my-codex-cursor">sesquicadaver/oh-my-codex-cursor</a> · Official OMX: <a href="https://github.com/Yeachan-Heo/oh-my-codex">Yeachan-Heo/oh-my-codex</a></span>
       </div>
     </footer>
   </body>

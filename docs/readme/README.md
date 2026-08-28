@@ -18,6 +18,8 @@ This folder holds the localized README files for oh-my-codex.
 
 The repository root keeps only the canonical `README.md` so the top level stays focused on the primary entry point, package metadata, and project-wide documents.
 
+This folder is part of the Cursor-host clone [`sesquicadaver/oh-my-codex-cursor`](https://github.com/sesquicadaver/oh-my-codex-cursor). Official OMX remains [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex). Translations should keep that identity banner and must not claim this clone is the official project.
+
 ## Available translations
 
 | Language            | File              |

@@ -1,10 +1,26 @@
-# `omx cursor`
+# Cursor host (`omx cursor`)
 
-`omx cursor` is the OMX-owned surface for **Cursor Agent** as a second host. It is not `omx adapt` (OpenClaw/Hermes/Herdr observation under `.omx/adapters/<target>/`), and it is not the VS Code/Cursor extension (`omx --direct` launcher).
+OMX is a workflow layer for [OpenAI Codex CLI](https://github.com/openai/codex). This page documents **Cursor Agent as a second host**.
 
-**Repository boundary:** this clone (`sesquicadaver/oh-my-codex-cursor`) is not an upstream contribution surface. Do not open pull requests against [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex) from this work.
+| Surface | Repository |
+| --- | --- |
+| This clone (Cursor host) | [`sesquicadaver/oh-my-codex-cursor`](https://github.com/sesquicadaver/oh-my-codex-cursor) |
+| Official OMX project | [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex) |
+| Official npm package | [`oh-my-codex`](https://www.npmjs.com/package/oh-my-codex) |
+
+This clone is not an official continuation, npm release line, or upstream pull-request surface. Do not open pull requests against [`Yeachan-Heo/oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex) from this work.
+
+`omx cursor` is the OMX-owned surface for Cursor Agent. It is not `omx adapt` (OpenClaw/Hermes/Herdr observation under `.omx/adapters/<target>/`), and it is not the VS Code/Cursor extension (`omx --direct` launcher).
 
 Cursor Agent can follow filesystem `SKILL.md` files. It does not run Codex `UserPromptSubmit` keyword routing, Stop-hook continuation, Codex `/goal` + `agent_type`, team tmux, or HUD layer 1.
+
+<table>
+<tr>
+<td><strong>🚨 CAUTION — Cursor Agent is not the default OMX path.</strong><br><br><strong>The recommended default remains macOS or Linux with Codex CLI from the official project.</strong><br><strong>Use this clone when you specifically want Cursor Agent to consume OMX filesystem skills without becoming a second Codex runtime.</strong></td>
+</tr>
+</table>
+
+Living specification: [`docs/cursor-host-tz-matrix.md`](./cursor-host-tz-matrix.md).
 
 ## Contract
 
@@ -13,9 +29,12 @@ Cursor Agent can follow filesystem `SKILL.md` files. It does not run Codex `User
 - **Runtime-gated skills stay gated.** `$autopilot`, `$ralph`, `$ultrawork`, `$team`, `$ultraqa`, and `$pipeline` need OMX CLI/tmux. Cursor Agent must not emulate those loops.
 - **Never register `omx_state` or `omx_hermes` in Cursor.** Unset `OMX_SESSION_ID` on Cursor MCP would write into a live Codex session.
 
-Living specification: [`docs/cursor-host-tz-matrix.md`](./cursor-host-tz-matrix.md).
+## Start here
 
-## Commands
+1. Install this clone on `PATH` from a checkout (`npm run build` then `npm install -g .`). Official `npm install -g oh-my-codex` does not include `omx cursor`.
+2. Keep Codex skills on disk: `omx setup --scope user --install-mode legacy`.
+3. Preview, then write: `omx cursor init` then `omx cursor init --write`.
+4. Inspect: `omx cursor status --json`, `omx cursor doctor`, and `omx doctor`.
 
 ```bash
 omx cursor init
@@ -24,6 +43,8 @@ omx cursor init --scope project --write --mcp wiki
 omx cursor status --json
 omx cursor doctor
 ```
+
+## Commands
 
 | Subcommand | Writes? | Behavior |
 | --- | --- | --- |
@@ -81,5 +102,6 @@ Canonical loop remains `$deep-interview` → `$ralplan` → `$ultragoal` (+ `$te
 - Port keyword-detector into Cursor
 - Enable `omx_memory`, `omx_state`, or `omx_hermes` MCP
 - Claim plugin marketplace as Cursor skill discovery
+- Replace the official OMX project or npm package
 
-`omx doctor` on this fork includes a **Cursor host** check. Plugin-mode setup fails that check because it archives the filesystem skill bridge.
+`omx doctor` on this clone includes a **Cursor host** check. Plugin-mode setup fails that check because it archives the filesystem skill bridge.
